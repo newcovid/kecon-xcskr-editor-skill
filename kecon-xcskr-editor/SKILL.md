@@ -58,6 +58,7 @@ python (Join-Path $keconSkillDir "scripts\xcskr_tool.py") export-ai --project "D
 python ... export-ai --project P --output-dir OUT --st-mode files
 python ... summary --project P
 python ... list-pous --project P
+python ... list-tasks --project P
 python ... extract-st --project P --pou-type program --name "Main" --output "$env:TEMP/Main.st"
 python ... list-downlinks --project P
 python ... list-slave-objects --project P
@@ -91,7 +92,24 @@ python ... set-attrs --project P --kind pou --pou-type function-block --name "FB
 python ... set-attrs --project P --kind block --name "底盘控制" --block "_MODULE0" --attr "DESC=chassis solver"
 ```
 
-Supported `set-attrs --kind`: `variable`, `hardware-tag`, `user-struct`, `user-struct-member`, `pou`, `pou-var`, `block`, `downlink-port`, `station`, `slave-object`, `slave-mapping`.
+Supported `set-attrs --kind`: `variable`, `hardware-tag`, `user-struct`, `user-struct-member`, `pou`, `pou-var`, `task`, `trig-condition`, `block`, `downlink-port`, `station`, `slave-object`, `slave-mapping`.
+
+Tasks:
+
+```powershell
+python ... list-tasks --project P
+python ... add-task --project P --cycle 100 --desc "low rate work"
+python ... set-attrs --project P --kind task --task-id 4 --attr "CYCLE=10"
+python ... set-attrs --project P --kind trig-condition --task-id 16 --attr "VAR=DI0001"
+```
+
+The help defines four kinds and one priority order: startup beats event, event
+beats cycle, cycle beats main, and a higher priority task preempts a lower one.
+A cycle period is the `CYCLE` attribute in milliseconds. An event task holds
+exactly one program, which `add-program` and `move-program` enforce. `add-task`
+only creates cycle tasks: an event task needs a `TRIG_CONDITION` whose encoding
+is only partly known, and the startup task tag has never been observed, so both
+are created in the GUI and edited from here afterwards.
 
 POUs:
 
@@ -155,7 +173,7 @@ python ... validate-canopen-command-ids --project P
 ## Structure Notes
 
 - Projects use bare LF and the tool reads and writes without newline translation, so an edit changes only what it targets. ST line breaks inside the `CONTENT` attribute may be literal LF, `&#10;`, or `&#x0D;&#x0A;`; `replace-st --newline-style auto` keeps whichever the POU or project already uses.
-- Main programs live under `CONTROL_SCHEME`, not just a flat POU list.
+- Main programs live under `CONTROL_SCHEME`, not just a flat POU list. Task discovery accepts any `*_TASK` element so an unrecognized kind is reported rather than dropped.
 - `CONTROL_SCHEME` may contain `MAIN_TASK`, `EVENT_TASK`, and `CYCLE_TASK`; each can contain one or more `PROGRAM` nodes, executed in document order.
 - `LOGIC_LANG` is `0` for LD, `1` for FBD, `2` for ST, and always agrees with the logic section element present under the POU.
 - Hardware variables are `HARDWARE_CHANNEL_TAG`, not ordinary `VARIABLE` nodes.

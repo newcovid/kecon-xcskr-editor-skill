@@ -33,18 +33,18 @@ FIXTURE_XML = """<?xml version="1.0" encoding="GBK"?>
       <HARDWARE_DEVICE_UPLINK_PORT NAME="Ethernet" DISPLAY="Ethernet" PHYSICAL_ID="16">
         <HARDWARE_ROBOT_CONTROLLER NAME="Controller">
           <CONTROL_SCHEME>
-            <MAIN_TASK ID="1" CYCLE_TIME="10">
+            <MAIN_TASK DESC="" ID="1" NAME="">
               <PROGRAM NAME="MainProgram" DESC="main task program" ID="0" LOGIC_LANG="2">
                 <SECTION_LOGIC_ST CONTENT="FB_SCALE(InValue:=1, Scale=>StatusWords[0]);" />
               </PROGRAM>
             </MAIN_TASK>
-            <EVENT_TASK ID="2" EVENT_TYPE="rising">
-              <TRIG_CONDITION TAG_NAME="DI0" CONDITION="RISING" />
+            <EVENT_TASK DESC="" EVENT_NAME="DI0 rising edge" ID="2">
               <PROGRAM NAME="EventProgram" DESC="event task program" ID="1" LOGIC_LANG="2">
                 <SECTION_LOGIC_ST CONTENT="SystemReady := TRUE;" />
               </PROGRAM>
+              <TRIG_CONDITION ENABLE_UPLIMIT="NO" EVENT_TRIGGER="0" LOWCOMPARE="-1" LOWLIMIT="" OPERATORCOMPARE="-1" UPCOMPARE="-1" UPLIMIT="" VAR="DI0" />
             </EVENT_TASK>
-            <CYCLE_TASK ID="3" CYCLE_TIME="20">
+            <CYCLE_TASK CYCLE="20" DESC="serial devices" ID="3">
               <PROGRAM NAME="CycleProgram" DESC="cycle task program" ID="2" LOGIC_LANG="2">
                 <SECTION_LOGIC_ST CONTENT="StatusWords[1] := StatusWords[0];" />
               </PROGRAM>
@@ -528,6 +528,68 @@ class XcskrToolTests(unittest.TestCase):
 
             clash = run_tool("add-function-block", "--project", str(project), "--name", "AlarmLatch", "--no-backup", check=False)
             self.assertEqual(clash.returncode, 2)
+
+    def test_cycle_and_event_tasks_are_read_and_edited(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            project = self.make_project(temp_path)
+
+            listed = json.loads(run_tool("list-tasks", "--project", str(project), "--format", "json").stdout)
+            by_kind = {row["kind"]: row for row in listed}
+            # Event beats cycle beats main, so the listing is ordered by priority.
+            self.assertEqual([row["kind"] for row in listed], ["event", "cycle", "main"])
+            # A cycle period lives in CYCLE, not CYCLE_TIME.
+            self.assertEqual(by_kind["cycle"]["cycle_ms"], "20")
+            self.assertEqual(by_kind["event"]["trigger"], "DI0 rising edge")
+
+            out_dir = temp_path / "pack"
+            run_tool("export-ai", "--project", str(project), "--output-dir", str(out_dir), "--st-mode", "none")
+            tasks = {task["kind"]: task for task in json.loads((out_dir / "index.json").read_text(encoding="utf-8"))["control_scheme"]["tasks"]}
+            self.assertEqual(tasks["cycle"]["cycle_ms"], "20")
+            self.assertEqual(tasks["event"]["event_name"], "DI0 rising edge")
+            self.assertEqual(tasks["event"]["trigger_condition"]["VAR"], "DI0")
+            self.assertIn("confirmed", tasks["event"]["trigger_condition"]["EVENT_TRIGGER_KIND"])
+
+            run_tool("add-task", "--project", str(project), "--cycle", "100", "--desc", "slow loop", "--no-backup")
+            run_tool("set-attrs", "--project", str(project), "--kind", "task", "--task-id", "3", "--attr", "CYCLE=10", "--no-backup")
+            run_tool("set-attrs", "--project", str(project), "--kind", "trig-condition", "--task-id", "2", "--attr", "VAR=DI1", "--no-backup")
+
+            after = {(row["kind"], row["id"]): row for row in json.loads(run_tool("list-tasks", "--project", str(project), "--format", "json").stdout)}
+            self.assertEqual(after[("cycle", "3")]["cycle_ms"], "10")
+            self.assertEqual(next(row for key, row in after.items() if row["cycle_ms"] == "100")["desc"], "slow loop")
+            index = json.loads((out_dir / "index.json").read_text(encoding="utf-8"))  # stale on purpose
+            run_tool("export-ai", "--project", str(project), "--output-dir", str(out_dir), "--st-mode", "none")
+            index = json.loads((out_dir / "index.json").read_text(encoding="utf-8"))
+            event = next(task for task in index["control_scheme"]["tasks"] if task["kind"] == "event")
+            self.assertEqual(event["trigger_condition"]["VAR"], "DI1")
+
+            # The help is explicit that an event task holds exactly one program.
+            refused = run_tool("add-program", "--project", str(project), "--name", "Second", "--task-kind", "event", "--no-backup", check=False)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("only one program", refused.stderr)
+
+    def test_unknown_task_kind_is_still_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            # The startup task tag is undocumented; discovery must not filter on a
+            # fixed tag list or such a task would vanish from the report.
+            raw = project.read_text(encoding="gbk")
+            raw = raw.replace(
+                "          </CONTROL_SCHEME>",
+                '            <STARTUP_TASK DELAY="500" ID="9">\n'
+                '              <PROGRAM NAME="BootProgram" DESC="" ID="8" LOGIC_LANG="2">\n'
+                '                <SECTION_LOGIC_ST CONTENT="SystemReady := FALSE;" />\n'
+                "              </PROGRAM>\n"
+                "            </STARTUP_TASK>\n"
+                "          </CONTROL_SCHEME>",
+                1,
+            )
+            project.write_text(raw, encoding="gbk", newline="")
+
+            rows = json.loads(run_tool("list-tasks", "--project", str(project), "--format", "json").stdout)
+            startup = next(row for row in rows if row["tag"] == "STARTUP_TASK")
+            self.assertEqual(startup["programs"], 1)
+            self.assertEqual(startup["order"], "BootProgram")
 
     def test_writes_preserve_file_line_endings(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

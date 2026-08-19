@@ -101,10 +101,37 @@ USER_STRUCT_MEMBER_DEFAULT_ATTRS = {
     "VISIBLE": "YES",
 }
 
+# The help lists four task kinds and one priority order: startup beats event,
+# event beats cycle, cycle beats main.  Only the first three appear in any
+# observed project, so the startup task tag is unknown and task discovery stays
+# tag-agnostic rather than filtering on this map.
 TASK_TAGS = {
     "main": "MAIN_TASK",
     "event": "EVENT_TASK",
     "cycle": "CYCLE_TASK",
+}
+TASK_KIND_BY_TAG = {tag: kind for kind, tag in TASK_TAGS.items()}
+TASK_PRIORITY = {"startup": 0, "event": 1, "cycle": 2, "main": 3}
+
+# Attributes seen on task start tags.  A cycle period is CYCLE, in milliseconds;
+# an event task carries the GUI trigger label in EVENT_NAME.  Anything else in
+# this list is speculative and only ever reported, never relied on.
+TASK_ATTR_KEYS = [
+    "ID", "NAME", "DESC", "CYCLE", "CYCLE_TIME", "INTERVAL", "PRIORITY",
+    "EVENT_NAME", "EVENT_TYPE", "ENABLE", "DELAY",
+]
+
+# TRIG_CONDITION EVENT_TRIGGER values follow the order the help lists the seven
+# trigger kinds in.  Only "0" is confirmed by an observed project, so the rest
+# are labelled as inferred and must be set through the GUI dialog when in doubt.
+EVENT_TRIGGER_KINDS = {
+    "0": "开关量-上升沿 (confirmed)",
+    "1": "开关量-下降沿 (inferred)",
+    "2": "开关量-上升沿或下降沿 (inferred)",
+    "3": "开关量-ON (inferred)",
+    "4": "开关量-OFF (inferred)",
+    "5": "模拟量条件 (inferred)",
+    "6": "EVENT功能块 (inferred)",
 }
 POU_VAR_SECTIONS = {
     "input": "SECTION_VAR_INPUT",
@@ -416,7 +443,7 @@ def collect_graphic_pous(
     FUNCTION POUs, because graphical logic is not limited to programs.
     """
     parent = {child: elem for elem in root.iter() for child in elem}
-    task_map = {"MAIN_TASK": "main", "EVENT_TASK": "event", "CYCLE_TASK": "cycle"}
+    task_map = dict(TASK_KIND_BY_TAG)
     wanted_tags = [POU_TAGS[pou_type]] if pou_type else list(POU_TAGS.values())
     kind_by_tag = {tag: kind for kind, tag in POU_TAGS.items()}
 
@@ -1065,31 +1092,38 @@ def collect_function_like_pous(
 
 
 def collect_control_scheme(root: ET.Element, text: str, st_mode: str, st_dir: Path | None, output_dir: Path) -> dict[str, object]:
-    task_map = {
-        "MAIN_TASK": "main",
-        "EVENT_TASK": "event",
-        "CYCLE_TASK": "cycle",
-    }
     tasks: list[dict[str, object]] = []
     programs: list[dict[str, object]] = []
     for scheme_index, scheme in enumerate(root.findall(".//CONTROL_SCHEME")):
         for task in list(scheme):
-            if task.tag not in task_map:
+            # A task is any _TASK element, or anything already holding programs.
+            # Filtering on a fixed tag list would drop the startup task, and
+            # requiring programs would drop a task that was just created.
+            if not is_task_element(task):
                 continue
-            task_kind = task_map[task.tag]
+            task_kind = TASK_KIND_BY_TAG.get(task.tag, task.tag.lower())
             task_record: dict[str, object] = {
                 "kind": task_kind,
                 "tag": task.tag,
                 "id": attr(task, "ID"),
                 "name": attr(task, "NAME"),
-                "cycle_time": attr(task, "CYCLE_TIME"),
-                "attrs": attrs_subset(task, ["ID", "NAME", "DESC", "CYCLE_TIME", "INTERVAL", "PRIORITY", "EVENT_TYPE", "ENABLE"]),
+                "desc": attr(task, "DESC"),
+                "cycle_ms": attr(task, "CYCLE"),
+                "cycle_time": attr(task, "CYCLE"),
+                "event_name": attr(task, "EVENT_NAME"),
+                "priority": TASK_PRIORITY.get(task_kind, 9),
+                "known_kind": task.tag in TASK_KIND_BY_TAG,
+                "attrs": attrs_subset(task, TASK_ATTR_KEYS),
                 "trigger_condition": {},
                 "programs": [],
             }
             trigger = task.find("./TRIG_CONDITION")
             if trigger is not None:
-                task_record["trigger_condition"] = dict(trigger.attrib)
+                trigger_attrs = dict(trigger.attrib)
+                trigger_attrs["EVENT_TRIGGER_KIND"] = EVENT_TRIGGER_KINDS.get(
+                    trigger_attrs.get("EVENT_TRIGGER", ""), "unknown"
+                )
+                task_record["trigger_condition"] = trigger_attrs
             for program in task.findall("./PROGRAM"):
                 name = attr(program, "NAME")
                 program_record: dict[str, object] = {
@@ -1467,6 +1501,24 @@ def patch_selected_attrs(text: str, args: argparse.Namespace, updates: dict[str,
         )
         start, end = local_start, local_end
         target = f"slave-mapping:{args.port_id}:{args.index}:{args.offset}"
+    elif args.kind == "task":
+        if not args.task_id and not args.task_kind:
+            raise ValueError("--task-id or --task-kind is required for kind=task")
+        task_start, _, task_raw, task_tag = find_task_span(text, args.task_id, args.task_kind)
+        local_start, local_end, attrs_map = find_start_tag_span(
+            task_raw, task_tag, lambda _: True, offset=task_start
+        )
+        start, end = local_start, local_end
+        target = f"task:{task_tag}:{attrs_map.get('ID', '')}"
+    elif args.kind == "trig-condition":
+        if not args.task_id and not args.task_kind:
+            raise ValueError("--task-id or --task-kind is required for kind=trig-condition")
+        task_start, task_end, _, _ = find_task_span(text, args.task_id, args.task_kind)
+        local_start, local_end, _ = find_start_tag_span(
+            text[task_start:task_end], "TRIG_CONDITION", lambda _: True, offset=task_start
+        )
+        start, end = local_start, local_end
+        target = f"trig-condition:{args.task_id or args.task_kind}"
     elif args.kind == "block":
         if not args.name or not args.block:
             raise ValueError("--name (POU name) and --block are required for kind=block")
@@ -2781,6 +2833,79 @@ def render_function_block(
     return "\n".join(lines)
 
 
+def is_task_element(elem: ET.Element) -> bool:
+    return elem.tag.endswith("_TASK") or elem.find("./PROGRAM") is not None
+
+
+def collect_task_rows(root: ET.Element) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for scheme in root.findall(".//CONTROL_SCHEME"):
+        for task in list(scheme):
+            if not is_task_element(task):
+                continue
+            kind = TASK_KIND_BY_TAG.get(task.tag, task.tag.lower())
+            trigger = task.find("./TRIG_CONDITION")
+            rows.append(
+                {
+                    "kind": kind,
+                    "tag": task.tag,
+                    "id": attr(task, "ID"),
+                    "priority": TASK_PRIORITY.get(kind, 9),
+                    "cycle_ms": attr(task, "CYCLE"),
+                    "trigger": attr(task, "EVENT_NAME")
+                    or (attr(trigger, "VAR") if trigger is not None else ""),
+                    "programs": len(task.findall("./PROGRAM")),
+                    "order": " > ".join(attr(program, "NAME") for program in task.findall("./PROGRAM")),
+                    "desc": attr(task, "DESC"),
+                }
+            )
+    rows.sort(key=lambda row: (row["priority"], str(row["id"])))
+    return rows
+
+
+def cmd_list_tasks(args: argparse.Namespace) -> int:
+    root = parse_xml(read_text(args.project, args.encoding))
+    rows = collect_task_rows(root)
+    output_rows(
+        rows,
+        ["kind", "tag", "id", "priority", "cycle_ms", "trigger", "programs", "order", "desc"],
+        args.format,
+        args.output,
+        args.output_encoding,
+    )
+    return 0
+
+
+def cmd_add_task(args: argparse.Namespace) -> int:
+    """Create a CYCLE_TASK.
+
+    Only cycle tasks are synthesized.  An event task needs a TRIG_CONDITION whose
+    encoding is only partly known and whose EVENT_NAME label the GUI composes,
+    and the startup task tag has never been observed, so both are left to the GUI.
+    """
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    used = {attr(task, "ID") for scheme in root.findall(".//CONTROL_SCHEME") for task in list(scheme)}
+    task_id = args.id
+    if task_id is None:
+        candidate = 1
+        while str(candidate) in used:
+            candidate += 1
+        task_id = str(candidate)
+    if task_id in used:
+        raise ValueError(f"task ID {task_id!r} is already used")
+    if args.cycle <= 0:
+        raise ValueError("--cycle must be a positive number of milliseconds")
+
+    attrs = {"CYCLE": str(args.cycle), "DESC": args.desc or "", "ID": task_id}
+
+    def build(indent: str) -> str:
+        return indent + xml_start_tag("CYCLE_TASK", attrs, False) + "\n" + indent + "</CYCLE_TASK>"
+
+    new_text = insert_container_child(text, "CONTROL_SCHEME", build)
+    return finish_write(args, new_text, f"AddedTask=CYCLE_TASK id={task_id} cycle={args.cycle}ms")
+
+
 def cmd_add_program(args: argparse.Namespace) -> int:
     text = read_text(args.project, args.encoding)
     root = parse_xml(text)
@@ -2789,6 +2914,8 @@ def cmd_add_program(args: argparse.Namespace) -> int:
         raise ValueError(f"PROGRAM {args.name!r} already exists")
 
     task_start, task_end, _, task_tag = find_task_span(text, args.task_id, args.task_kind)
+    if task_tag == "EVENT_TASK" and program_positions(text, task_start, task_end):
+        raise ValueError("an EVENT_TASK may hold only one program; add it to another task")
     offset, indent = resolve_insert_offset(
         text, task_start, task_end, task_tag, args.after, args.before, args.index
     )
@@ -2829,6 +2956,8 @@ def cmd_move_program(args: argparse.Namespace) -> int:
     without = text[:cut_start] + text[cut_end:]
 
     task_start, task_end, _, task_tag = find_task_span(without, args.task_id, args.task_kind)
+    if task_tag == "EVENT_TASK" and program_positions(without, task_start, task_end):
+        raise ValueError("an EVENT_TASK may hold only one program; move it to another task")
     offset, indent = resolve_insert_offset(
         without, task_start, task_end, task_tag, args.after, args.before, args.index
     )
@@ -2992,7 +3121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("set-attrs", help="set attributes on selected structured project entities without hand-editing XML")
     add_common_project_arg(p)
-    p.add_argument("--kind", required=True, choices=["variable", "hardware-tag", "user-struct", "user-struct-member", "pou", "pou-var", "block", "downlink-port", "station", "slave-object", "slave-mapping"])
+    p.add_argument("--kind", required=True, choices=["variable", "hardware-tag", "user-struct", "user-struct-member", "pou", "pou-var", "task", "trig-condition", "block", "downlink-port", "station", "slave-object", "slave-mapping"])
     p.add_argument("--name", help="entity name, or POU name for kind=pou/pou-var")
     p.add_argument("--pou-type", choices=sorted(POU_TAGS), help="required for kind=pou or kind=pou-var")
     p.add_argument("--var-section", choices=["input", "output", "internal"], help="required for kind=pou-var")
@@ -3000,6 +3129,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--struct", help="user structure name for kind=user-struct or kind=user-struct-member")
     p.add_argument("--member", help="user structure member name for kind=user-struct-member")
     p.add_argument("--block", help="CONTROL_LOGIC_BLOCK NAME for kind=block")
+    p.add_argument("--task-id", help="task ID for kind=task or kind=trig-condition")
+    p.add_argument("--task-kind", choices=sorted(TASK_TAGS), help="task kind for kind=task or kind=trig-condition")
     p.add_argument("--port-id", help="downlink port ID for kind=downlink-port")
     p.add_argument("--address", help="station address for kind=station")
     p.add_argument("--index", help="CANopen slave object index in decimal for kind=slave-object/slave-mapping")
@@ -3136,6 +3267,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true", help="exit non-zero when problems are found")
     p.add_argument("--show-all", action="store_true", help="print every checked row, not only problems")
     p.set_defaults(func=cmd_validate_datatypes)
+
+    p = sub.add_parser("list-tasks", help="list control scheme tasks with period, trigger and program order")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.set_defaults(func=cmd_list_tasks)
+
+    p = sub.add_parser("add-task", help="create a CYCLE_TASK; event and startup tasks must be created in the GUI")
+    add_common_project_arg(p)
+    p.add_argument("--kind", choices=["cycle"], default="cycle")
+    p.add_argument("--cycle", type=int, required=True, help="period in milliseconds")
+    p.add_argument("--desc")
+    p.add_argument("--id", help="explicit task ID; default is the next free id")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(func=cmd_add_task)
 
     p = sub.add_parser("add-program", help="create a PROGRAM inside a control scheme task")
     add_common_project_arg(p)

@@ -24,6 +24,7 @@ agent picks it up from `SKILL.md`.
 | Area | Read | Write |
 |---|---|---|
 | Project / task / POU overview | `summary`, `list-pous`, `export-ai` | — |
+| Control scheme tasks | `list-tasks` | `add-task` (cycle only), `set-attrs --kind task` / `--kind trig-condition` |
 | Programs and function blocks | `list-pous`, `export-ai` | `add-program`, `move-program`, `add-function-block`, `add-pou-var`, `copy-pou` |
 | ST program bodies | `extract-st` | `replace-st` |
 | LD / FBD graphical logic | `export-graphic` | `set-pin`, `connect-pins`, `disconnect-line`, `copy-block`, `set-attrs --kind block` |

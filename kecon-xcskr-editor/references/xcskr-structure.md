@@ -60,8 +60,31 @@ Implications:
 
 - A flat `PROGRAM` list loses task context.
 - Main task, event task, and cycle task programs should be reviewed from `export-ai` `index.json` / `programs.json`.
-- Event tasks can carry trigger configuration in `TRIG_CONDITION`.
-- Cycle tasks may carry timing attributes such as `CYCLE_TIME` or project-version-specific equivalents.
+- The help defines four kinds: main, cycle, event and startup, with priority
+  startup > event > cycle > main. A higher priority task preempts a lower one.
+  Only the first three appear in any observed project, so the startup task tag
+  is unknown; task discovery therefore accepts any `*_TASK` element instead of
+  matching a fixed list.
+- A cycle task carries its period as `CYCLE` in milliseconds. `CYCLE_TIME` on a
+  task has never been observed; the attribute of that name on
+  `HARDWARE_CAN_CMD_GROUP` is a different thing.
+- An event task holds exactly one program. It carries the GUI trigger label in
+  `EVENT_NAME` and the machine-readable condition in a `TRIG_CONDITION` child,
+  written after the program:
+
+```text
+EVENT_TASK DESC="" EVENT_NAME="DI0002 上升沿" ID="16"
+  PROGRAM
+  TRIG_CONDITION VAR="DI0002" EVENT_TRIGGER="0" ENABLE_UPLIMIT="NO"
+                 LOWCOMPARE="-1" LOWLIMIT="" OPERATORCOMPARE="-1"
+                 UPCOMPARE="-1" UPLIMIT=""
+```
+
+  The help lists seven trigger kinds in this order: rising edge, falling edge,
+  either edge, ON, OFF, analog condition, EVENT function block. `EVENT_TRIGGER="0"`
+  is confirmed to be the rising edge; the rest of the mapping follows that order
+  and is inferred, so an event trigger is best configured in the GUI dialog and
+  only adjusted from here.
 - Programs execute in document order within a task, so the order of `PROGRAM`
   siblings is functional, not cosmetic. `move-program` reorders them safely.
 - `PROGRAM` IDs are unique across the whole project, not per task (verified).
