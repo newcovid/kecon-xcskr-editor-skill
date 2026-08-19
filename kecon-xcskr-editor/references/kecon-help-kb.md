@@ -26,7 +26,15 @@ python (Join-Path $keconSkillDir "scripts\kecon_help.py") search "关键词"
 
 关键词可用中文或英文，例如：`功能块`、`CAN`、`CANopen`、`Modbus`、`主任务`、`周期任务`、`事件任务`、`安全IO`、`导航`、`底盘`、`模型组态`。
 
-如果命中信息不足，再查原文。CHM 可用 `hh.exe -decompile <输出目录> <chm路径>` 反编译后搜索 HTML；PDF 可用 `pypdf` 或 PyMuPDF 提取文本。
+该命令同时检索本文知识库和**本机 CHM 原文索引**。若原文索引尚未建立，先执行一次（约 10 秒）：
+
+```powershell
+python (Join-Path $keconSkillDir "scripts/kecon_help.py") index --chm "D:/KCSmart/xRobotDesigner/Resource/chs/HelpFile/xCSStudioHelpFile.chm"
+```
+
+建完后：`show <主题id>` 看全文，`list --pattern <正则>` 浏览目录，`status` 查索引状态。索引用系统自带 `hh.exe` 反编译 CHM，只缓存纯文本（约 1.4 MB），默认放在 `~/.kecon-xcskr-editor/help`，**官方帮助原文不随本 Skill 分发**。
+
+PDF 手册另行处理：可用 `pypdf` 或 PyMuPDF 提取文本；若磁盘上被透明加密，需要用户先另存一份明文。
 
 ## 工程、控制方案与任务
 

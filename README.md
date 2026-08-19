@@ -5,12 +5,34 @@ xRobotDesigner `.xcskr` PLC 工程。
 
 ## 功能
 
+### 读取
+
 - 将 GBK XML 工程导出为紧凑的 AI 可读结构包。
 - 检查控制方案、任务、程序、功能块、变量和用户数据类型。
-- 导出 LD/FBD 的块、引脚、连接和连线结构。
-- 提取或替换 ST，并尽量保留原始换行格式。
+- 导出 LD/FBD 的块、引脚、连接（区分变量绑定与连线）、连线和注释结构。
+- 提取 ST 源码。
+- 检索本机 xRobotDesigner 帮助原文（见下方“帮助原文检索”）。
+
+### 写入
+
+- 新建 PROGRAM、调整任务内程序执行顺序（程序按文档顺序执行，顺序即语义）。
+- 新建 FUNCTION_BLOCK 及其接口变量，追加 POU 接口变量。
+- 新建用户数据类型和自定义变量，自动生成 VARIABLE_MEMBER 成员树；结构体改动后可用
+  `rebuild-variable-members` 重建，`validate-datatypes` 递归查成员树漂移。
+- 图形逻辑：引脚绑定变量、两引脚连线、拆线、从参考工程复制功能块。
+- 替换 ST，保留该 POU 或工程原有的换行编码风格。
 - 定点修改变量、POU、硬件标签、CAN/CANopen 对象和映射属性。
-- 创建时间戳备份，并提供 ST 格式和 CANopen 命令 ID 静态检查。
+- 创建时间戳备份，并提供 ST 格式、数据类型、CANopen 命令 ID 静态检查。
+
+### 写入保真
+
+读写均关闭换行转换，生成的 XML 复现 GUI 的属性集合、字母序属性顺序和自闭合写法，
+缩进步长从目标文件读取。对官方样例工程做“解绑再绑回”“拆线再接回”的往返测试，
+结果与原件逐字节一致。
+
+XML 结构约定不是从单个工程猜的，而是与 xRobotDesigner 随附的官方示例工程逐项核对过，
+详见 [`references/xcskr-structure.md`](kecon-xcskr-editor/references/xcskr-structure.md)
+和 [`references/ld-fbd-st.md`](kecon-xcskr-editor/references/ld-fbd-st.md)。
 
 ## 仓库结构
 
@@ -61,11 +83,22 @@ python ".\kecon-xcskr-editor\scripts\xcskr_tool.py" export-ai `
   --st-mode files
 ```
 
-搜索随 Skill 提供的精简帮助知识库：
+## 帮助原文检索
+
+`kecon_help.py` 同时检索随 Skill 提供的精简知识库，以及从本机 xRobotDesigner
+帮助 CHM 建立的原文索引。建索引使用 Windows 自带的 `hh.exe -decompile`，无需安装
+任何依赖；Word 导出的表格会压成管道分隔行，因此功能块参数表可以直接读；`.hhc`
+目录文件提供每个主题的真实标题和层级路径。
 
 ```powershell
-python ".\kecon-xcskr-editor\scripts\kecon_help.py" search "CANopen"
+python ".\kecon-xcskr-editor\scripts\kecon_help.py" status
+python ".\kecon-xcskr-editor\scripts\kecon_help.py" index --chm "<xCSStudioHelpFile.chm 的本机路径>"
+python ".\kecon-xcskr-editor\scripts\kecon_help.py" search "八差速 底盘"
+python ".\kecon-xcskr-editor\scripts\kecon_help.py" show 八差速_舵轮总成底盘
 ```
+
+索引只缓存纯文本，默认放在 `~/.kecon-xcskr-editor/help`，可用 `--cache-dir` 或环境
+变量 `KECON_HELP_CACHE` 改位置。**官方帮助原文只留在本机，不进入本仓库。**
 
 完整命令及安全约束请参阅
 [`kecon-xcskr-editor/SKILL.md`](kecon-xcskr-editor/SKILL.md)。
