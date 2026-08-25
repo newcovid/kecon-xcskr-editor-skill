@@ -31,7 +31,7 @@ agent picks it up from `SKILL.md`.
 | User data types | `export-ai` | `add-user-struct`, `add-user-struct-member`, `remove` |
 | User variables | `export-ai` | `add-variable`, `rebuild-variable-members`, `remove` |
 | Hardware config, CANopen, Modbus | `list-downlinks`, `list-slave-objects`, `export-slave-mappings`, `list-hardware-tags` | `set-attrs` on existing entities |
-| Static checks | `validate-st-format`, `validate-datatypes`, `validate-canopen-command-ids` | — |
+| Static checks | `validate-st-format`, `validate-datatypes`, `validate-canopen-command-ids`, `validate-hardware-bindings`, `validate-command-directions`, `validate-fb-calls` | `rebuild-user-struct-members` | — |
 | Vendor help | `kecon_help.py search` / `show` / `list` | `kecon_help.py index` |
 
 Not supported by design: creating a task, a hardware device or a graphical
@@ -114,3 +114,15 @@ every read and write command against it.
 Static XML checks only prove the edited file is structurally sane. Compiling and
 downloading in xRobotDesigner is the real validation; always hand the project
 back for a GUI compile after editing.
+
+## Vendor reference resources
+
+The tool reads the xRobotDesigner function block library, data type library,
+help files and (optionally) official sample projects. None of those paths are
+hard-coded -- they differ per machine, install language and version.
+
+Resolution order: CLI flag -> environment variable -> `kecon-resources.json` ->
+probing. Copy `kecon-resources.example.json` to `kecon-resources.json` and edit
+it; that file is git-ignored because the paths are per-machine and often
+personal. Run `python scripts/xcskr_tool.py resources` to see what resolved and
+from where.

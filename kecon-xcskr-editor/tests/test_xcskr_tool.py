@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +33,16 @@ FIXTURE_XML = """<?xml version="1.0" encoding="GBK"?>
   <HARDWARE>
     <HARDWARE_NET ID="0">
       <HARDWARE_DEVICE_UPLINK_PORT NAME="Ethernet" DISPLAY="Ethernet" PHYSICAL_ID="16">
-        <HARDWARE_ROBOT_CONTROLLER NAME="Controller">
+        <HARDWARE_ROBOT_CONTROLLER NAME="Controller" TYPE="IVC300" VERSION="5.0.0">
+          <GENERAL_CFG CAR_DRIVER_TYPE="23" CAR_WHEEL_COUNT="2" CAR_LENGTH="9750" CAR_WIDTH="3170" CAR_WHEEL_DIAMETER="450" />
+          <WHEEL_CFG CAR_WHEEL_DIAMETER="100" CAR_WHEEL_X_POS="4250" CAR_WHEEL_Y_POS="1364" />
+          <WHEEL_CFG CAR_WHEEL_DIAMETER="100" CAR_WHEEL_X_POS="4250" CAR_WHEEL_Y_POS="-1364" />
+          <NAVI_CFG INIT_NAVA_MODE="5" NAVI_SUPPORT_LASER="NO" />
+          <WIZARD_CONFIG CHASSIS_TYPE="Eight-DifferentialAssembly" CONTROLLER="IVC300" PATH="BaseVehicleModel/UniversalVehicle" SUPPORT_CORE_BLOCK="3" VERSION="5.0.0">
+            <WIZARD_DEVICE NAME="chassis_structure" DESC="chassis" ENABLE="YES" SUB_TYPE="design_wizard">
+              <WIZARD_DEVICE_PARAM NAME="chassis_type" TYPE="chassis_type" VALUE="23" />
+            </WIZARD_DEVICE>
+          </WIZARD_CONFIG>
           <CONTROL_SCHEME>
             <MAIN_TASK DESC="" ID="1" NAME="">
               <PROGRAM NAME="MainProgram" DESC="main task program" ID="0" LOGIC_LANG="2">
@@ -102,6 +113,22 @@ FIXTURE_XML = """<?xml version="1.0" encoding="GBK"?>
                     </HARDWARE_CHANNEL_TAG>
                   </HARDWARE_CAN_CMD>
                 </HARDWARE_CAN_CMD_GROUP>
+                <HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="NO" INDEX_ID="0" SUB_INDEX_ID="0" CMD_ACCESS_TYPE="" OUTPUT_LENGTH="2" CYCLE_TIME="100">
+                  <HARDWARE_CAN_CMD ID="0">
+                    <HARDWARE_CHANNEL_TAG NAME="Axis1_XCS_RPDO1" DATATYPE="BYTE[2]" DESC="disabled pdo" ENABLE="NO" INIT_VALUE="" READONLY="NO" VISIBLE="YES">
+                      <VARIABLE_MEMBER NAME="Axis1_XCS_RPDO1[0]" DATATYPE="BYTE" DESC="" INIT_VALUE="0" READONLY="NO" VISIBLE="YES" />
+                      <VARIABLE_MEMBER NAME="Axis1_XCS_RPDO1[1]" DATATYPE="BYTE" DESC="" INIT_VALUE="0" READONLY="NO" VISIBLE="YES" />
+                    </HARDWARE_CHANNEL_TAG>
+                  </HARDWARE_CAN_CMD>
+                </HARDWARE_CAN_CMD_GROUP>
+                <HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_TPDO1" HARDWARE_GROUP_ENABLE="NO" INDEX_ID="0" SUB_INDEX_ID="0" CMD_ACCESS_TYPE="" OUTPUT_LENGTH="2" CYCLE_TIME="100">
+                  <HARDWARE_CAN_CMD ID="0">
+                    <HARDWARE_CHANNEL_TAG NAME="Axis1_XCS_TPDO1" DATATYPE="BYTE[2]" DESC="disabled pdo" ENABLE="NO" INIT_VALUE="" READONLY="NO" VISIBLE="YES">
+                      <VARIABLE_MEMBER NAME="Axis1_XCS_TPDO1[0]" DATATYPE="BYTE" DESC="" INIT_VALUE="0" READONLY="NO" VISIBLE="YES" />
+                      <VARIABLE_MEMBER NAME="Axis1_XCS_TPDO1[1]" DATATYPE="BYTE" DESC="" INIT_VALUE="0" READONLY="NO" VISIBLE="YES" />
+                    </HARDWARE_CHANNEL_TAG>
+                  </HARDWARE_CAN_CMD>
+                </HARDWARE_CAN_CMD_GROUP>
               </HARDWARE_CAN_DEVICE_SLAVE>
             </HARDWARE_CAN_DEVICE_MOTOR>
           </HARDWARE_DEVICE_UPLINK_PORT>
@@ -126,12 +153,24 @@ FIXTURE_XML = """<?xml version="1.0" encoding="GBK"?>
 """
 
 
+# The tool prints Chinese.  On Windows a piped stdout defaults to the ANSI code
+# page, so decoding it as UTF-8 here turns every message into U+FFFD and any
+# assertIn("<中文>", ...) fails no matter what the tool said.  Pin the child.
+CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def run_tool(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         check=check,
+        env=CHILD_ENV,
         text=True,
         encoding="utf-8",
+        # The tool prints project text verbatim, and a Windows console running a
+        # GBK codepage hands back bytes utf-8 cannot decode. Without this the
+        # decode raises, stdout comes back None, and unrelated tests fail
+        # depending on the console codepage rather than on the tool.
+        errors="replace",
         capture_output=True,
     )
 
@@ -607,6 +646,544 @@ class XcskrToolTests(unittest.TestCase):
             after = project.read_bytes()
             self.assertNotIn(b"\r\n", after)
             self.assertGreater(len(after), len(before))
+
+    def test_export_ai_reports_controller_and_chassis_config(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = self.make_project(root)
+            out = root / "pack"
+
+            run_tool("export-ai", "--project", str(project), "--output-dir", str(out))
+
+            index = json.loads((out / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["controller"]["type"], "IVC300")
+            self.assertEqual(index["controller"]["chassis_driver_type"], "23")
+            self.assertEqual(index["controller"]["chassis_driver_type_name"], "八差速总成底盘")
+
+            controller = json.loads((out / "controller.json").read_text(encoding="utf-8"))
+            self.assertEqual(controller["general_cfg"]["CAR_DRIVER_TYPE"], "23")
+            self.assertEqual(controller["wizard_config"]["CHASSIS_TYPE"], "Eight-DifferentialAssembly")
+            self.assertEqual(len(controller["wheel_cfg"]), 2)
+            self.assertEqual(controller["wizard_devices"][0]["params"][0]["VALUE"], "23")
+
+    def test_set_node_id_updates_both_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project = self.make_project(Path(folder))
+
+            run_tool("set-node-id", "--project", str(project), "--port-id", "5",
+                     "--address", "1", "--node-id", "9", "--no-backup")
+
+            text = project.read_text(encoding="gbk", newline="")
+            self.assertIn('<HARDWARE_DEVICE_UPLINK_PORT ADDRESS="9"', text)
+            self.assertIn('NODE_ID="9"', text)
+            self.assertNotIn('NODE_ID="1"', text)
+
+    def put_st(self, project: Path, pou: str, body: str) -> None:
+        st = project.parent / "body.st"
+        st.write_text(body, encoding="utf-8", newline="")
+        run_tool("replace-st", "--project", str(project), "--pou-type", "program",
+                 "--name", pou, "--st-file", str(st), "--no-backup")
+
+    def test_validate_fb_calls_flags_a_pin_left_out(self) -> None:
+        # A pin left out and a pin out of order look identical from the
+        # compiler: one FBDError id=769, no line number, no pin named.  The
+        # checker used to pass calls that simply omitted a pin.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            self.put_st(project, "CycleProgram", "FB_SCALE(InValue=1);")
+
+            result = run_tool("validate-fb-calls", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pin not listed", result.stdout)
+            self.assertIn("Scale", result.stdout)
+
+    def test_validate_fb_calls_passes_when_every_pin_is_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            self.put_st(project, "CycleProgram", "FB_SCALE(InValue=1, Scale=>StatusWords[0]);")
+
+            result = run_tool("validate-fb-calls", "--project", str(project), check=False)
+
+            self.assertIn("FB_CALLS=OK", result.stdout)
+
+    def test_validate_canopen_command_ids_flags_an_enabled_group_without_an_id(self) -> None:
+        # xRobotDesigner allocates the command id when the group is ticked in
+        # the GUI.  A group enabled by editing the XML goes live without one,
+        # and the compiler then blames the PROGRAMS that use the tag
+        # (文本"<tag>"错误，字符串无法识别) instead of the group -- 216 errors
+        # from 27 such groups on IVC300, 2026-08-25.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            raw = raw.replace(
+                '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="NO"',
+                '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="YES"')
+            project.write_text(raw, encoding="gbk", newline="")
+
+            result = run_tool("validate-canopen-command-ids", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CANOPEN_COMMAND_IDS=FAIL", result.stdout)
+            self.assertIn("EnabledWithoutId=1", result.stdout)
+
+    def test_validate_canopen_command_ids_leaves_disabled_groups_alone(self) -> None:
+        # An id of "" or "0" is normal on a group that was never enabled, and
+        # those repeat freely -- only enabled groups need one.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("validate-canopen-command-ids", "--project", str(project), check=False)
+
+            self.assertIn("CANOPEN_COMMAND_IDS=OK", result.stdout)
+
+    def test_alloc_canopen_command_ids_fills_enabled_groups_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            raw = raw.replace(
+                '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="NO"',
+                '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="YES"')
+            project.write_text(raw, encoding="gbk", newline="")
+
+            result = run_tool("alloc-canopen-command-ids", "--project", str(project),
+                              "--no-backup", check=False)
+
+            self.assertIn("Assigned=1", result.stdout)
+            patched = project.read_text(encoding="gbk", newline="")
+            rpdo = patched.index('HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1"')
+            tpdo = patched.index('HARDWARE_CMD_TAG_NAME="Axis1_XCS_TPDO1"')
+            self.assertIn('<HARDWARE_CAN_CMD ID="1">', patched[rpdo:tpdo])
+            # the still-disabled group keeps its "0"
+            self.assertIn('<HARDWARE_CAN_CMD ID="0">', patched[tpdo:])
+            self.assertIn("CANOPEN_COMMAND_IDS=OK",
+                          run_tool("validate-canopen-command-ids", "--project", str(project)).stdout)
+
+    def test_alloc_canopen_command_ids_never_reuses_a_taken_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            raw = raw.replace('<HARDWARE_CAN_CMD ID="cmd1">', '<HARDWARE_CAN_CMD ID="1">')
+            raw = raw.replace(
+                '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="NO"',
+                '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1" HARDWARE_GROUP_ENABLE="YES"')
+            project.write_text(raw, encoding="gbk", newline="")
+
+            result = run_tool("alloc-canopen-command-ids", "--project", str(project),
+                              "--no-backup", "--format", "json", check=False)
+
+            self.assertIn('"cmd_id": 2', result.stdout)
+
+    def test_rename_hardware_tag_moves_members_and_command_group_together(self) -> None:
+        # ST addresses the members (`Tag[0]`), not the tag, and the command group
+        # finds its tag by name.  A rename that moves only the start tag leaves a
+        # project that parses and compiles but whose references resolve nowhere.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            run_tool("rename-hardware-tag", "--project", str(project),
+                     "--old", "Axis1_Position_6004", "--new", "Motor9_Position_6004",
+                     "--no-backup")
+
+            raw = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn("Axis1_Position_6004", raw)
+            self.assertIn('NAME="Motor9_Position_6004"', raw)
+            self.assertIn('NAME="Motor9_Position_6004[0]"', raw)
+            self.assertIn('NAME="Motor9_Position_6004[3]"', raw)
+            self.assertIn('HARDWARE_CMD_TAG_NAME="Motor9_Position_6004"', raw)
+
+    def test_rename_hardware_tag_refuses_an_occupied_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_bytes()
+
+            result = run_tool("rename-hardware-tag", "--project", str(project),
+                              "--old", "Axis1_Position_6004",
+                              "--new", "Axis1_XCS_RPDO1", "--no-backup", check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_set_attrs_refuses_to_rename_a_hardware_tag(self) -> None:
+        # The safe path is rename-hardware-tag; set-attrs would touch the start
+        # tag alone and silently orphan every member.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_bytes()
+
+            result = run_tool("set-attrs", "--project", str(project),
+                              "--kind", "hardware-tag", "--name", "Axis1_Position_6004",
+                              "--attr", "NAME=Whatever", "--no-backup", check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("rename-hardware-tag", result.stderr)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_set_attrs_can_enable_a_canopen_command_group(self) -> None:
+        # A CANopen object goes live only when both halves are on: the channel
+        # tag and the command group that transmits it.  Before `cmd-group`
+        # existed there was no way to reach the group without hand-editing XML,
+        # and enabling just the tag yields a variable that never moves.
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            project = self.make_project(temp_path)
+
+            run_tool(
+                "set-attrs", "--project", str(project),
+                "--kind", "cmd-group", "--name", "Axis1_XCS_RPDO1",
+                "--attr", "HARDWARE_GROUP_ENABLE=YES",
+                "--attr", "MODE=1",
+                "--no-backup",
+            )
+
+            raw = project.read_text(encoding="gbk", newline="")
+            group = re.search(
+                r'<HARDWARE_CAN_CMD_GROUP [^>]*HARDWARE_CMD_TAG_NAME="Axis1_XCS_RPDO1"[^>]*>', raw)
+            self.assertIsNotNone(group)
+            self.assertIn('HARDWARE_GROUP_ENABLE="YES"', group.group(0))
+            self.assertIn('MODE="1"', group.group(0))
+            # The other group must be untouched.
+            other = re.search(
+                r'<HARDWARE_CAN_CMD_GROUP [^>]*HARDWARE_CMD_TAG_NAME="Axis1_Position_6004"[^>]*>', raw)
+            self.assertNotIn('MODE="1"', other.group(0))
+
+    def test_set_attrs_refuses_partial_node_id_write(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project = self.make_project(Path(folder))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "station",
+                              "--port-id", "5", "--address", "1", "--attr", "ADDRESS=9",
+                              "--no-backup", check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("set-node-id", result.stdout + result.stderr)
+            self.assertIn('NODE_ID="1"', project.read_text(encoding="gbk", newline=""))
+
+    def test_validate_controller_support_skips_without_install_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = self.make_project(root)
+            missing = root / "no-such-install"
+
+            result = run_tool("validate-controller-support", "--project", str(project),
+                              "--install-dir", str(missing))
+
+            self.assertIn("Controller=IVC300", result.stdout)
+            self.assertIn("ChassisDriverType=23", result.stdout)
+            self.assertIn("CONTROLLER_SUPPORT=SKIP", result.stdout)
+
+    def test_released_command_ids_are_not_duplicates(self) -> None:
+        """xRobotDesigner resets a disabled command id to "0"; that is not an id."""
+        with tempfile.TemporaryDirectory() as folder:
+            project = self.make_project(Path(folder))
+
+            result = run_tool("validate-canopen-command-ids", "--project", str(project))
+
+            self.assertIn("CANOPEN_COMMAND_IDS=OK", result.stdout)
+            self.assertNotIn("DuplicateRows", result.stdout)
+
+    def test_unencodable_character_leaves_project_untouched(self) -> None:
+        """A character outside the project encoding must fail before any write."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = self.make_project(root)
+            before = project.read_bytes()
+            st = root / "bad.st"
+            st.write_text("(* 直径 Ø450 *)", encoding="utf-8", newline="")
+
+            result = run_tool("replace-st", "--project", str(project),
+                              "--pou-type", "program", "--name", "MainProgram",
+                              "--st-file", str(st), "--st-encoding", "utf-8",
+                              "--no-backup", check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot encode", result.stdout + result.stderr)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_write_leaves_no_temporary_file_behind(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = self.make_project(root)
+            st = root / "ok.st"
+            st.write_text("(* 正常注释 *)", encoding="utf-8", newline="")
+
+            run_tool("replace-st", "--project", str(project),
+                     "--pou-type", "program", "--name", "MainProgram",
+                     "--st-file", str(st), "--st-encoding", "utf-8", "--no-backup")
+
+            leftovers = [f.name for f in root.iterdir() if ".tmp_" in f.name]
+            self.assertEqual(leftovers, [])
+
+    def test_command_directions_pass_when_every_output_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            result = run_tool("validate-command-directions", "--project", str(project))
+            self.assertIn("COMMAND_DIRECTIONS=OK", result.stdout)
+
+    def test_enabled_output_command_no_program_writes_is_reported(self) -> None:
+        # An output command sends the tag's contents to the device on schedule.
+        # With nothing writing the tag the device is fed zeros forever, and code
+        # that parses the same tag reads its own buffer instead of the device --
+        # the project compiles clean either way.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_Position_6004" HARDWARE_GROUP_ENABLE="YES" INDEX_ID="24580" SUB_INDEX_ID="0" CMD_ACCESS_TYPE="ro"',
+                    '<HARDWARE_CAN_CMD_GROUP HARDWARE_CMD_TAG_NAME="Axis1_Position_6004" HARDWARE_GROUP_ENABLE="YES" INDEX_ID="24580" SUB_INDEX_ID="0" EDTYPE="0" CMD_ACCESS_TYPE="rw"',
+                ),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-command-directions", "--project", str(project), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("COMMAND_DIRECTIONS=FAIL", result.stdout)
+            self.assertIn("OutputNeverWrittenByST=1", result.stdout)
+            self.assertIn("Axis1_Position_6004", result.stdout)
+
+    def test_program_writing_an_input_command_tag_is_reported(self) -> None:
+        # The mirror case: the master overwrites the tag on every poll, so the
+        # program's write silently disappears.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    'CONTENT="FB_SCALE(InValue:=1, Scale=&gt;StatusWords[0]);"',
+                    'CONTENT="Axis1_Position_6004[0] := 0;"',
+                ).replace(
+                    'CONTENT="FB_SCALE(InValue:=1, Scale=>StatusWords[0]);"',
+                    'CONTENT="Axis1_Position_6004[0] := 0;"',
+                ),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-command-directions", "--project", str(project), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("InputOverwrittenByST=1", result.stdout)
+
+    def test_fb_calls_pass_when_argument_order_matches_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            result = run_tool("validate-fb-calls", "--project", str(project))
+            self.assertIn("FB_CALLS=OK", result.stdout)
+
+    def test_fb_call_with_extra_pin_before_declared_one_is_reported(self) -> None:
+        # Kecon ST calls read like named arguments, so the order looks optional.
+        # It is not: inputs must follow SECTION_VAR_INPUT order and outputs
+        # SECTION_VAR_OUTPUT order. Getting it wrong fails the build with one
+        # FBDError per call site, carrying no line number and naming no pin --
+        # which is exactly why this is worth catching here instead.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    '<SECTION_VAR_INPUT NAME="InValue" DATATYPE="INT" DESC="input value" INIT_VALUE="" VISIBLE="YES" />',
+                    '<SECTION_VAR_INPUT NAME="Gain" DATATYPE="INT" DESC="gain" INIT_VALUE="" VISIBLE="YES" />'
+                    '<SECTION_VAR_INPUT NAME="InValue" DATATYPE="INT" DESC="input value" INIT_VALUE="" VISIBLE="YES" />',
+                ).replace(
+                    'CONTENT="FB_SCALE(InValue:=1, Scale=&gt;StatusWords[0]);"',
+                    'CONTENT="FB_SCALE(InValue:=1, Gain:=2, Scale=&gt;StatusWords[0]);"',
+                ).replace(
+                    'CONTENT="FB_SCALE(InValue:=1, Scale=>StatusWords[0]);"',
+                    'CONTENT="FB_SCALE(InValue:=1, Gain:=2, Scale=>StatusWords[0]);"',
+                ),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-fb-calls", "--project", str(project), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("FB_CALLS=FAIL", result.stdout)
+            self.assertIn("FB_SCALE", result.stdout)
+            self.assertIn("input order is InValue,Gain", result.stdout)
+
+    def test_fb_call_naming_an_undeclared_pin_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    'CONTENT="FB_SCALE(InValue:=1, Scale=&gt;StatusWords[0]);"',
+                    'CONTENT="FB_SCALE(InValue:=1, Typo:=2, Scale=&gt;StatusWords[0]);"',
+                ).replace(
+                    'CONTENT="FB_SCALE(InValue:=1, Scale=>StatusWords[0]);"',
+                    'CONTENT="FB_SCALE(InValue:=1, Typo:=2, Scale=>StatusWords[0]);"',
+                ),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-fb-calls", "--project", str(project), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("pin not declared: Typo", result.stdout)
+
+    def test_added_struct_array_member_is_expanded_per_element(self) -> None:
+        # The GUI writes an array member of a user data type as a parent with one
+        # child per element, and both official sample projects do the same. A
+        # flat self-closing member declares the same type and still compiles,
+        # but the editor counts and lays out members per element, so its member
+        # list and offset column would disagree with the declaration.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool(
+                "add-user-struct-member", "--project", str(project),
+                "--struct", "DriveStatus", "--member", "Flags:BOOL[4]:bit flags",
+                "--no-backup",
+            )
+            text = project.read_text(encoding="gbk")
+            self.assertIn('DATATYPE="BOOL[4]"', text)
+            for i in range(4):
+                self.assertIn(f'NAME="Flags[{i}]"', text)
+
+    def test_flat_struct_array_member_is_reported_and_rebuildable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    "</USER_STRUCT>",
+                    '<USER_STRUCT_MEMBER DATATYPE="BOOL[4]" DESC="" INIT_VALUE="" NAME="Flat" VISIBLE="YES"/>'
+                    "</USER_STRUCT>",
+                    1,
+                ),
+                encoding="gbk",
+            )
+
+            # validate-datatypes only fails the run under --strict
+            result = run_tool("validate-datatypes", "--project", str(project), "--strict", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ARRAY_NOT_EXPANDED", result.stdout)
+
+            run_tool("rebuild-user-struct-members", "--project", str(project), "--no-backup")
+            self.assertIn('NAME="Flat[3]"', project.read_text(encoding="gbk"))
+            run_tool("validate-datatypes", "--project", str(project), "--strict")
+
+    def test_rebuild_user_struct_members_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool(
+                "add-user-struct-member", "--project", str(project),
+                "--struct", "DriveStatus", "--member", "Flags:BOOL[4]:bit flags",
+                "--no-backup",
+            )
+            before = project.read_bytes()
+            result = run_tool("rebuild-user-struct-members", "--project", str(project), "--no-backup")
+            self.assertIn("RebuiltUserStructMembers=0", result.stdout)
+            self.assertEqual(before, project.read_bytes())
+
+    def test_resources_reports_missing_install_dir_without_crashing(self) -> None:
+        # A machine without xRobotDesigner installed must still get a readable
+        # report saying what was not found, not a traceback.
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "kecon-resources.json"
+            config.write_text(
+                json.dumps({"install_dir": str(Path(temp) / "nowhere"), "sample_projects": []}),
+                encoding="utf-8",
+            )
+            result = run_tool("resources", "--config", str(config), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("InstallDir=NOT FOUND", result.stdout)
+            self.assertIn("WARNING", result.stdout)
+
+    def test_resources_reads_paths_from_a_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # Minimal fake install: Resource/chs/history/1.2.3/FBLib/MRC with one block.
+            lib = root / "install" / "Resource" / "chs" / "history" / "1.2.3" / "FBLib" / "MRC"
+            lib.mkdir(parents=True)
+            (lib / "Math.xml").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?><FBs>'
+                '<FB id="0x1" name="DEMO_ADD" desc="demo" type="FC">'
+                '<INPUT><PIN name="X" datatype="INT" desc=""/><PIN name="Y" datatype="INT" desc=""/></INPUT>'
+                '<OUTPUT><PIN name="Q" datatype="INT" desc=""/></OUTPUT>'
+                "</FB></FBs>",
+                encoding="utf-8",
+            )
+            samples = root / "samples"
+            samples.mkdir()
+            (samples / "demo.xcskr").write_text(FIXTURE_XML, encoding="gbk")
+
+            config = root / "kecon-resources.json"
+            config.write_text(
+                json.dumps({
+                    "install_dir": str(root / "install"),
+                    "lang": "chs",
+                    "version": "latest",
+                    "sample_projects": [str(samples)],
+                }),
+                encoding="utf-8",
+            )
+
+            result = run_tool("resources", "--config", str(config))
+            self.assertIn("(from config)", result.stdout)
+            self.assertIn("VersionsInstalled=1.2.3", result.stdout)
+            self.assertIn("FunctionBlocks=1", result.stdout)
+            self.assertIn("SampleProjects=1", result.stdout)
+            self.assertIn("demo.xcskr", result.stdout)
+
+    def test_resource_flag_beats_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for version in ("1.0.0", "2.0.0"):
+                lib = root / "install" / "Resource" / "chs" / "history" / version / "FBLib" / "MRC"
+                lib.mkdir(parents=True)
+                (lib / "Math.xml").write_text("<FBs></FBs>", encoding="utf-8")
+            config = root / "kecon-resources.json"
+            config.write_text(
+                json.dumps({"install_dir": str(root / "install"), "lang": "chs", "version": "latest"}),
+                encoding="utf-8",
+            )
+
+            latest = run_tool("resources", "--config", str(config))
+            self.assertIn("2.0.0", latest.stdout.split("FunctionBlockLib=")[1].splitlines()[0])
+
+            pinned = run_tool("resources", "--config", str(config), "--version", "1.0.0")
+            self.assertIn("Version=1.0.0 (from flag)", pinned.stdout)
+            self.assertIn("1.0.0", pinned.stdout.split("FunctionBlockLib=")[1].splitlines()[0])
+
+    def test_hardware_bindings_pass_on_a_consistent_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            result = run_tool("validate-hardware-bindings", "--project", str(project))
+            self.assertIn("HARDWARE_BINDINGS=OK", result.stdout)
+
+    def test_renaming_a_channel_tag_alone_is_reported_as_dangling(self) -> None:
+        # Renaming HARDWARE_CHANNEL_TAG@NAME without the command group that feeds it
+        # leaves the object polled on the bus but written nowhere, and the project
+        # still compiles -- exactly the silent failure this check exists for.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    '<HARDWARE_CHANNEL_TAG NAME="Axis1_Position_6004"',
+                    '<HARDWARE_CHANNEL_TAG NAME="Motor1_Position_6004"',
+                ),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-hardware-bindings", "--project", str(project), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("HARDWARE_BINDINGS=FAIL", result.stdout)
+            self.assertIn("DanglingBindings=1", result.stdout)
+            self.assertIn("Axis1_Position_6004", result.stdout)
+
+    def test_enabled_group_pointing_at_a_disabled_tag_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace(
+                    '<HARDWARE_CHANNEL_TAG NAME="Axis1_Position_6004" DATATYPE="BYTE[4]" DESC="axis position" ENABLE="YES"',
+                    '<HARDWARE_CHANNEL_TAG NAME="Axis1_Position_6004" DATATYPE="BYTE[4]" DESC="axis position" ENABLE="NO"',
+                ),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-hardware-bindings", "--project", str(project), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("EnabledGroupWithDisabledTag=1", result.stdout)
 
     def test_cli_help_is_generic(self) -> None:
         result = run_tool("--help")

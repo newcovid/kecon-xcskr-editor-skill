@@ -18,6 +18,12 @@ venv/
 *.bak_*
 kecon_ai_pack/
 ai-pack/
+help-cache/
+.cache/
+
+# Per-machine resource paths: install dir, sample projects, extra manuals.
+# These are personal directory layouts, so only the .example.json is tracked.
+kecon-resources.json
 
 # Editors and operating systems
 .idea/

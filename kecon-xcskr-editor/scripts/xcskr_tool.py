@@ -18,6 +18,7 @@ import argparse
 import csv
 import html
 import json
+import os
 import re
 import shutil
 import sys
@@ -180,7 +181,35 @@ def read_text(path: Path, encoding: str = DEFAULT_ENCODING) -> str:
 
 
 def write_text(path: Path, text: str, encoding: str = DEFAULT_ENCODING) -> None:
-    path.write_text(text, encoding=encoding, newline="")
+    """Replace a project file atomically, and never with a half-formed result.
+
+    Two failure modes must be impossible here, because the target is the user's
+    only copy of a large hand-built project:
+
+    * An un-encodable character has to fail before the file is touched.
+      ``Path.write_text`` truncates first and encodes second, so one character
+      outside the project encoding is enough to destroy the project.
+    * A crash or a full disk mid-write must leave the original intact, so the
+      new bytes go to a sibling temporary file that is renamed into place.
+    """
+    try:
+        data = text.encode(encoding, errors="strict")
+    except UnicodeEncodeError as exc:
+        bad = text[exc.start:exc.end]
+        line = text.count(chr(10), 0, exc.start) + 1
+        raise ValueError(
+            f"cannot encode {bad!r} (U+{ord(bad[0]):04X}) at line {line} in {encoding}; "
+            f"the project file was left untouched -- replace the character and retry."
+        ) from exc
+
+    tmp = path.with_name(path.name + ".tmp_" + str(os.getpid()))
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
 
 
 def document_eol(text: str) -> str:
@@ -288,11 +317,27 @@ def find_section_logic_raw(pou_raw: str) -> tuple[int, int, str]:
     return match.start(), match.end(), match.group(2)
 
 
+def section_logic_self_closing_spacer(element_raw: str) -> str:
+    """Return the whitespace this element uses before its `/>`.
+
+    Different xRobotDesigner versions normalize this differently: the V5.0
+    sample projects write `" />` and V5.1.1.9998-C writes `"/>`.  Rewriting an
+    element in the other style is semantically identical, but it shows up in
+    every diff and stops an otherwise unchanged round trip from being
+    byte-identical, so the existing style is preserved the same way the
+    newline style is.
+    """
+    body = element_raw[:-2] if element_raw.endswith("/>") else element_raw
+    stripped = body.rstrip()
+    return body[len(stripped):]
+
+
 def replace_section_logic_raw(pou_raw: str, st_text: str, newline_style: str = "auto", fallback_style: str = "literal") -> str:
     start, end, old_raw_content = find_section_logic_raw(pou_raw)
     if newline_style == "auto":
         newline_style = detect_newline_style(old_raw_content) if old_raw_content else fallback_style
-    replacement = f'<SECTION_LOGIC_ST CONTENT="{xml_attr_encode(st_text, newline_style)}" />'
+    spacer = section_logic_self_closing_spacer(pou_raw[start:end])
+    replacement = f'<SECTION_LOGIC_ST CONTENT="{xml_attr_encode(st_text, newline_style)}"{spacer}/>'
     return pou_raw[:start] + replacement + pou_raw[end:]
 
 
@@ -661,15 +706,30 @@ def first_child(elem: ET.Element, tag: str) -> ET.Element | None:
     return next((child for child in elem if child.tag == tag), None)
 
 
-def collect_canopen_command_id_rows(root: ET.Element, enabled_only: bool = False) -> list[dict[str, object]]:
-    """Collect non-empty HARDWARE_CAN_CMD IDs under CANopen master slave nodes."""
+def collect_canopen_command_id_rows(
+    root: ET.Element, enabled_only: bool = False, include_unallocated: bool = False
+) -> list[dict[str, object]]:
+    """Collect HARDWARE_CAN_CMD IDs under CANopen master slave nodes.
+
+    An id counts as allocated only when it is neither empty nor "0".
+    xRobotDesigner writes an empty id on a command group that has never been
+    enabled and resets an id to "0" when a previously enabled group is switched
+    off, so on a DISABLED group both values just mean "no id" and repeat freely.
+
+    On an ENABLED group they are fatal, and that is the trap this collector used
+    to hide by skipping them (see cmd_validate_canopen_command_ids).  Pass
+    include_unallocated=True to get those rows back with cmd_id="".
+    """
 
     parent = {child: elem for elem in root.iter() for child in elem}
     rows: list[dict[str, object]] = []
     for cmd in root.iter("HARDWARE_CAN_CMD"):
         cmd_id = cmd.get("ID", "")
-        if not cmd_id:
-            continue
+        allocated = bool(cmd_id) and cmd_id.strip() != "0"
+        if not allocated:
+            if not include_unallocated:
+                continue
+            cmd_id = ""
         group = nearest_ancestor(parent, cmd, "HARDWARE_CAN_CMD_GROUP")
         slave = nearest_ancestor(parent, cmd, "HARDWARE_CAN_DEVICE_SLAVE")
         uplink = nearest_ancestor(parent, cmd, "HARDWARE_DEVICE_UPLINK_PORT")
@@ -811,6 +871,7 @@ def cmd_copy_pou(args: argparse.Namespace) -> int:
     return 0
 
 
+
 def cmd_validate_st_format(args: argparse.Namespace) -> int:
     text = read_text(args.project, args.encoding)
     root = parse_xml(text)
@@ -891,10 +952,27 @@ def cmd_list_hardware_tags(args: argparse.Namespace) -> int:
 
 
 def cmd_validate_canopen_command_ids(args: argparse.Namespace) -> int:
+    """Two ways a command id kills a build, both invisible in the file.
+
+    Duplicates are the obvious one.  The other is an ENABLED group whose
+    `<HARDWARE_CAN_CMD ID>` is empty: xRobotDesigner allocates the id when you
+    tick the group in the GUI, so a group enabled by editing the XML directly
+    (set-attrs --kind cmd-group) goes live without one.  The project parses, the
+    tag exists, the group looks enabled -- and the compiler then blames every
+    program that touches the tag with 文本"<tag>"错误，字符串无法识别 plus one
+    无法识别引脚连接的变量 per pin, all reported on 第1行 no matter where the
+    reference really is.  Nothing points at the command group.
+    Verified 2026-08-25 on IVC300: 27 enabled 6083/6084 groups with an empty id
+    produced 216 such errors; the 5 sibling groups that still carried a stale id
+    compiled untouched.  Fix with alloc-canopen-command-ids.
+    """
     root = parse_xml(read_text(args.project, args.encoding))
-    rows = collect_canopen_command_id_rows(root, args.enabled_only)
+    rows = collect_canopen_command_id_rows(root, args.enabled_only, include_unallocated=True)
+    missing = [r for r in rows if r["cmd_id"] == "" and r["group_enable"] == "YES"]
     seen: dict[tuple[str, str] | tuple[str], list[dict[str, object]]] = {}
     for row in rows:
+        if row["cmd_id"] == "":
+            continue
         if args.scope == "port":
             key: tuple[str, str] | tuple[str] = (str(row["port_id"]), str(row["cmd_id"]))
         else:
@@ -917,16 +995,419 @@ def cmd_validate_canopen_command_ids(args: argparse.Namespace) -> int:
         "mode",
         "cycle",
     ]
-    if duplicate_rows:
+    problems = duplicate_rows + missing
+    if problems:
         print("CANOPEN_COMMAND_IDS=FAIL")
         print(f"Checked={len(rows)}")
         print(f"DuplicateRows={len(duplicate_rows)}")
-        output_rows(duplicate_rows, columns, args.format, args.output, args.output_encoding)
+        print(f"EnabledWithoutId={len(missing)}")
+        if missing:
+            print(" - 启用的命令组没有命令号，编译会报「文本\"<标签名>\"错误，字符串无法识别」")
+            print("   补号：xcskr_tool.py alloc-canopen-command-ids --project ...")
+        output_rows(problems, columns, args.format, args.output, args.output_encoding)
         return 1
     print("CANOPEN_COMMAND_IDS=OK")
     print(f"Checked={len(rows)}")
     if args.show_all:
         output_rows(rows, columns, args.format, args.output, args.output_encoding)
+    return 0
+
+
+CMD_GROUP_START_RE = re.compile(r"<HARDWARE_CAN_CMD_GROUP\b[^>]*>")
+CMD_START_RE = re.compile(r"<HARDWARE_CAN_CMD\b[^>]*>")
+
+
+def scan_command_groups(text: str) -> list[dict[str, object]]:
+    """Pair every command group in the RAW text with its command start tag.
+
+    Raw text, not the parsed tree, because every writer in this file edits the
+    file as text -- re-serialising would reorder attributes across the whole
+    project.  `<HARDWARE_CAN_CMD\b` does not match `<HARDWARE_CAN_CMD_GROUP`:
+    there is no word boundary between "D" and "_".
+    """
+    close = "</HARDWARE_CAN_CMD_GROUP>"
+    out: list[dict[str, object]] = []
+    for gm in CMD_GROUP_START_RE.finditer(text):
+        gattrs = parse_start_tag_attrs(gm.group(0))
+        gend = text.find(close, gm.end())
+        if gend < 0:
+            continue
+        cm = CMD_START_RE.search(text, gm.end(), gend)
+        if cm is None:
+            continue
+        out.append({
+            "name": gattrs.get("HARDWARE_CMD_TAG_NAME", ""),
+            "enabled": gattrs.get("HARDWARE_GROUP_ENABLE", "") == "YES",
+            "cmd_start": cm.start(),
+            "cmd_end": cm.end(),
+            "cmd_tag": cm.group(0),
+            "cmd_id": parse_start_tag_attrs(cm.group(0)).get("ID", "").strip(),
+        })
+    return out
+
+
+def cmd_alloc_canopen_command_ids(args: argparse.Namespace) -> int:
+    """Give every enabled command group a command id, the way the GUI would.
+
+    The GUI hands out ids when you tick a group, keeping them dense from 1 over
+    the enabled groups; groups that were never enabled carry ID="".  Enabling a
+    group by editing the XML skips that step and the build dies -- see
+    cmd_validate_canopen_command_ids for what the errors look like.
+
+    Only uniqueness is load-bearing (verified: a project compiled fine with ids
+    scattered up to 229 and holes at 217..224).  Filling holes first is just
+    housekeeping so the file keeps looking like one the GUI wrote.
+    """
+    text = read_text(args.project, args.encoding)
+    groups = scan_command_groups(text)
+    used = {int(g["cmd_id"]) for g in groups
+            if g["cmd_id"] not in ("", "0") and str(g["cmd_id"]).isdigit()}
+    todo = [g for g in groups if g["enabled"] and g["cmd_id"] in ("", "0")]
+    orphan = [g for g in groups if not g["enabled"] and g["cmd_id"] not in ("", "0")]
+
+    assigned: list[tuple[str, int]] = []
+    nxt = 1
+    for group in todo:
+        while nxt in used:
+            nxt += 1
+        used.add(nxt)
+        assigned.append((str(group["name"]), nxt))
+        group["new_id"] = nxt
+
+    # Patch back-to-front so earlier spans keep their offsets.
+    new_text = text
+    for group in sorted((g for g in todo), key=lambda g: g["cmd_start"], reverse=True):
+        patched = patch_start_tag_attrs(str(group["cmd_tag"]), {"ID": str(group["new_id"])})
+        new_text = new_text[:group["cmd_start"]] + patched + new_text[group["cmd_end"]:]
+    parse_xml(new_text)
+
+    rows = [{"tag_name": n, "cmd_id": i} for n, i in assigned]
+    print(f"Groups={len(groups)}")
+    print(f"Enabled={sum(1 for g in groups if g['enabled'])}")
+    print(f"Assigned={len(assigned)}")
+    if orphan:
+        # Harmless -- a disabled group is not compiled -- but it means the id
+        # space is no longer dense, so say so instead of silently renumbering.
+        print(f"DisabledGroupsHoldingIds={len(orphan)}")
+    if args.dry_run:
+        print("DRY_RUN=OK")
+        output_rows(rows, ["tag_name", "cmd_id"], args.format, args.output, args.output_encoding)
+        return 0
+    if not assigned:
+        print("ALLOC_CANOPEN_COMMAND_IDS=NOOP")
+        return 0
+    backup = None if args.no_backup else make_backup(args.project)
+    write_text(args.project, new_text, args.encoding)
+    print(f"Backup={backup}" if backup else "Backup=SKIPPED")
+    print("ALLOC_CANOPEN_COMMAND_IDS=OK")
+    output_rows(rows, ["tag_name", "cmd_id"], args.format, args.output, args.output_encoding)
+    return 0
+
+
+def collect_hardware_binding_rows(root: ET.Element) -> list[dict[str, object]]:
+    """Pair every CANopen command group with the channel tag it writes into.
+
+    A command group names its variable through HARDWARE_CMD_TAG_NAME.  Renaming a
+    HARDWARE_CHANNEL_TAG without renaming that attribute leaves the group pointing
+    at a name that no longer exists: the object is still polled on the bus, but its
+    value never reaches any variable.  The project still compiles, so nothing warns
+    about it -- hence this check.
+    """
+    tag_enable: dict[str, str] = {}
+    for tag in root.iter("HARDWARE_CHANNEL_TAG"):
+        name = tag.get("NAME", "")
+        if name:
+            tag_enable[name] = tag.get("ENABLE", "")
+
+    rows: list[dict[str, object]] = []
+    for group in root.iter("HARDWARE_CAN_CMD_GROUP"):
+        name = group.get("HARDWARE_CMD_TAG_NAME", "")
+        enabled = group.get("HARDWARE_GROUP_ENABLE", "")
+        rows.append({
+            "tag_name": name,
+            "group_enable": enabled,
+            "tag_exists": "YES" if name in tag_enable else "NO",
+            "tag_enable": tag_enable.get(name, ""),
+            "index": int_hex(group.get("INDEX_ID", "")),
+            "sub": group.get("SUB_INDEX_ID", ""),
+        })
+    return rows
+
+
+def cmd_validate_hardware_bindings(args: argparse.Namespace) -> int:
+    root = parse_xml(read_text(args.project, args.encoding))
+    rows = collect_hardware_binding_rows(root)
+    enabled = [r for r in rows if r["group_enable"] == "YES"]
+    dangling = [r for r in enabled if r["tag_exists"] == "NO"]
+    disabled_tag = [r for r in enabled if r["tag_exists"] == "YES" and r["tag_enable"] == "NO"]
+    columns = ["tag_name", "group_enable", "tag_exists", "tag_enable", "index", "sub"]
+
+    problems = dangling + disabled_tag
+    if problems:
+        print("HARDWARE_BINDINGS=FAIL")
+        print(f"Checked={len(rows)}")
+        print(f"EnabledGroups={len(enabled)}")
+        print(f"DanglingBindings={len(dangling)}")
+        print(f"EnabledGroupWithDisabledTag={len(disabled_tag)}")
+        output_rows(problems, columns, args.format, args.output, args.output_encoding)
+        return 1
+    print("HARDWARE_BINDINGS=OK")
+    print(f"Checked={len(rows)}")
+    print(f"EnabledGroups={len(enabled)}")
+    if args.show_all:
+        output_rows(enabled, columns, args.format, args.output, args.output_encoding)
+    return 0
+
+
+# HARDWARE_CAN_CMD_GROUP@MODE, verified against the xRobotDesigner GUI dropdown.
+SEND_MODES = {
+    "0": "cyclic",      # 周期: resend every CYCLE_TIME ms
+    "1": "on-change",   # 变化发布: send only when the tag value changes
+    "2": "on-init",     # 初始化执行: send once when the station starts
+    "3": "change+cycle" # 变化加周期: send on change and on the cycle
+}
+
+
+def st_assignment_targets(root: ET.Element) -> set[str]:
+    """Every identifier any POU assigns to, ignoring comments.
+
+    Covers both assignment forms Kecon ST uses: `Name := x;` / `Name[0] := x;`
+    and the function block output form `Q_L=>Name[1]`.
+    """
+    targets: set[str] = set()
+    for tag in POU_TAGS.values():
+        for elem in root.findall(f".//{tag}"):
+            sec = elem.find(".//SECTION_LOGIC_ST")
+            if sec is None:
+                continue
+            body = sec.get("CONTENT", "").replace("\\n", "\n")
+            body = re.sub(r"\(\*.*?\*\)", " ", body, flags=re.DOTALL)
+            for match in re.finditer(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*:=", body):
+                targets.add(match.group(1))
+            for match in re.finditer(r"=>\s*([A-Za-z_]\w*)", body):
+                targets.add(match.group(1))
+    return targets
+
+
+def command_group_direction(group: ET.Element) -> str:
+    """input = master reads the slave, output = master writes the slave.
+
+    EDTYPE is the field the GUI shows as 输入命令 / 输出命令.  It is sometimes
+    absent, in which case the EDS access string decides: a read-only object can
+    only be an input.
+    """
+    edtype = group.get("EDTYPE", "")
+    if edtype == "1":
+        return "input"
+    if edtype == "0":
+        return "output"
+    return "input" if group.get("CMD_ACCESS_TYPE", "") == "ro" else "output"
+
+
+def collect_command_direction_rows(root: ET.Element) -> list[dict[str, object]]:
+    written = st_assignment_targets(root)
+    rows: list[dict[str, object]] = []
+    for group in root.iter("HARDWARE_CAN_CMD_GROUP"):
+        name = group.get("HARDWARE_CMD_TAG_NAME", "")
+        if not name:
+            continue
+        mode = group.get("MODE", "")
+        rows.append({
+            "tag_name": name,
+            "enabled": group.get("HARDWARE_GROUP_ENABLE", ""),
+            "direction": command_group_direction(group),
+            "send": SEND_MODES.get(mode, mode or "(none)"),
+            "cycle_ms": group.get("CYCLE_TIME", ""),
+            "written_by_st": "YES" if name in written else "NO",
+            "index": int_hex(group.get("INDEX_ID", "")),
+            "sub": group.get("SUB_INDEX_ID", ""),
+        })
+    return rows
+
+
+def cmd_validate_command_directions(args: argparse.Namespace) -> int:
+    """Catch CANopen command groups whose direction contradicts the program.
+
+    An enabled output command sends the tag's contents to the device on the
+    configured schedule.  If no program ever writes that tag, the device is
+    being fed zeros forever -- and any code that parses the same tag is reading
+    its own buffer rather than the device.  The mirror case, a program writing
+    a tag the master overwrites on every poll, is just as silent.
+    """
+    root = parse_xml(read_text(args.project, args.encoding))
+    rows = collect_command_direction_rows(root)
+    enabled = [r for r in rows if r["enabled"] == "YES"]
+
+    unwritten = [r for r in enabled if r["direction"] == "output" and r["written_by_st"] == "NO"]
+    overwritten = [r for r in enabled if r["direction"] == "input" and r["written_by_st"] == "YES"]
+    repeating = ("cyclic", "change+cycle")
+    cyclic_writes = [r for r in enabled if r["direction"] == "output" and r["send"] in repeating]
+
+    columns = ["tag_name", "enabled", "direction", "send", "cycle_ms", "written_by_st", "index", "sub"]
+    problems = unwritten + overwritten
+    if problems:
+        print("COMMAND_DIRECTIONS=FAIL")
+        print(f"Checked={len(rows)}")
+        print(f"EnabledGroups={len(enabled)}")
+        print(f"OutputNeverWrittenByST={len(unwritten)}")
+        print(f"InputOverwrittenByST={len(overwritten)}")
+        print(f"CyclicOutputs={len(cyclic_writes)}")
+        output_rows(problems, columns, args.format, args.output, args.output_encoding)
+        return 1
+    print("COMMAND_DIRECTIONS=OK")
+    print(f"Checked={len(rows)}")
+    print(f"EnabledGroups={len(enabled)}")
+    print(f"CyclicOutputs={len(cyclic_writes)}")
+    if args.show_all:
+        output_rows(enabled, columns, args.format, args.output, args.output_encoding)
+    return 0
+
+
+def load_library_function_blocks_from(folder: Path) -> dict[str, tuple[list[str], list[str]]]:
+    """Pin names, in declaration order, for every block in one FBLib/MRC folder.
+
+    The library is the authority on pin names and order -- the compiler rejects a
+    call whose arguments are ordered differently, and its only message is the
+    FBD-worded "功能块实例与库中定义不一致" with no line number, so guessing a
+    pin order is expensive.
+
+    Blocks with a variadic pin group (`base_name` plus min/max instead of
+    explicit PIN elements, e.g. ADD's X1..X32) come back with empty lists: their
+    arguments are positional and cannot be mis-ordered the way named pins can.
+    """
+    blocks: dict[str, tuple[list[str], list[str]]] = {}
+    if not folder.is_dir():
+        return blocks
+    fb_re = re.compile(r"<FB\b([^>]*)>(.*?)</FB>", re.S)
+    for path in sorted(folder.glob("*.xml")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in fb_re.finditer(text):
+            name_m = re.search(r'name="([^"]+)"', match.group(1))
+            if not name_m or name_m.group(1) in blocks:
+                continue
+            body = match.group(2)
+            sections = []
+            for tag in ("INPUT", "OUTPUT"):
+                sec = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", body, re.S)
+                sections.append(re.findall(r'<PIN\b[^>]*name="([^"]+)"', sec.group(1)) if sec else [])
+            blocks[name_m.group(1)] = (sections[0], sections[1])
+    return blocks
+
+
+def project_function_block_pins(root: ET.Element) -> dict[str, tuple[list[str], list[str]]]:
+    """Declaration order of every FUNCTION_BLOCK defined inside the project."""
+    out: dict[str, tuple[list[str], list[str]]] = {}
+    for elem in root.findall(".//FUNCTION_BLOCK"):
+        name = elem.get("NAME", "")
+        if not name:
+            continue
+        ins = [v.get("NAME", "") for v in elem.findall("SECTION_VAR_INPUT")]
+        outs = [v.get("NAME", "") for v in elem.findall("SECTION_VAR_OUTPUT")]
+        out[name] = (ins, outs)
+    return out
+
+
+ST_CALL_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\s*\(([^;]*?)\)\s*;", re.S)
+ST_CALL_SKIP = {"IF", "FOR", "WHILE", "AND", "OR", "NOT", "MOD", "CASE", "RETURN"}
+
+
+def cmd_validate_fb_calls(args: argparse.Namespace) -> int:
+    """Check every function block call lists its pins in declaration order.
+
+    Kecon ST calls look like named arguments, so the order reads optional -- it
+    is not.  Inputs must appear in SECTION_VAR_INPUT order and outputs in
+    SECTION_VAR_OUTPUT order, or the project fails to compile with one
+    FBDError id=769 per offending call site.  That error carries no line number
+    and does not name the offending pin, which makes it slow to chase by hand.
+    """
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+
+    decls = project_function_block_pins(root)
+    res = resolve_resources(args)
+    lib_dir = res["fb_lib_dir"]
+    lib_count = 0
+    if lib_dir is not None:
+        library = load_library_function_blocks_from(lib_dir)
+        lib_count = len(library)
+        for name, pins in library.items():
+            decls.setdefault(name, pins)
+
+    rows: list[dict[str, object]] = []
+    checked = 0
+    for pou_type, tag in POU_TAGS.items():
+        for elem in root.findall(f".//{tag}"):
+            pou_name = elem.get("NAME", "")
+            sec = elem.find(".//SECTION_LOGIC_ST")
+            if sec is None:
+                continue
+            body = sec.get("CONTENT", "").replace("\\n", "\n")
+            # Blank out comments without moving anything: same length, newlines
+            # kept.  Collapsing them to a single space would shift every later
+            # offset and make the reported line number wrong, which matters
+            # because the compiler's own FBDError carries no line number at all.
+            body = re.sub(
+                r"\(\*.*?\*\)",
+                lambda m: "".join("\n" if ch == "\n" else " " for ch in m.group(0)),
+                body,
+                flags=re.DOTALL,
+            )
+            for call in ST_CALL_RE.finditer(body):
+                fb = call.group(1)
+                if fb in ST_CALL_SKIP or fb not in decls:
+                    continue
+                checked += 1
+                args_text = call.group(2)
+                used_in = [m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*:?=(?!>)", args_text)]
+                used_out = [m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*:?=>", args_text)]
+                decl_in, decl_out = decls[fb]
+                # variadic library blocks declare no explicit pins; nothing to order
+                if not decl_in and not decl_out:
+                    continue
+                want_in = [p for p in decl_in if p in used_in]
+                want_out = [p for p in decl_out if p in used_out]
+                unknown = [p for p in used_in + used_out if p not in decl_in + decl_out]
+                # A pin left out is as fatal as one out of order, and looks the
+                # same from the compiler: one FBDError id=769, no line number,
+                # no pin named.  Every call site in this project lists every
+                # pin -- MOTOR_MAP's 19 included.
+                missing = ([p for p in decl_in if p not in used_in]
+                           + [p for p in decl_out if p not in used_out])
+                problem = ""
+                if unknown:
+                    problem = f"pin not declared: {','.join(unknown)}"
+                elif missing:
+                    problem = f"pin not listed: {','.join(missing)}"
+                elif used_in != want_in:
+                    problem = f"input order is {','.join(used_in)}; declared {','.join(want_in)}"
+                elif used_out != want_out:
+                    problem = f"output order is {','.join(used_out)}; declared {','.join(want_out)}"
+                if problem:
+                    rows.append({
+                        "pou_type": pou_type,
+                        "pou": pou_name,
+                        "line": body.count("\n", 0, call.start()) + 1,
+                        "block": fb,
+                        "problem": problem,
+                    })
+
+    columns = ["pou_type", "pou", "line", "block", "problem"]
+    if rows:
+        print("FB_CALLS=FAIL")
+        print(f"Checked={checked}")
+        print(f"LibraryBlocks={lib_count}")
+        print(f"Problems={len(rows)}")
+        output_rows(rows, columns, args.format, args.output, args.output_encoding)
+        return 1
+    print("FB_CALLS=OK")
+    print(f"Checked={checked}")
+    print(f"LibraryBlocks={lib_count}")
+    if lib_dir is None:
+        print("WARNING: function block library not found; only project-defined blocks were checked")
+        print("WARNING: run `resources` to see how paths are being resolved")
     return 0
 
 
@@ -1267,6 +1748,559 @@ def write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+# --- 控制器 / 组态向导配置 -------------------------------------------------
+#
+# 这一段数据不在 CONTROL_SCHEME 也不在 HARDWARE 树的常规位置，但它决定编译能否通过：
+# GENERAL_CFG@CAR_DRIVER_TYPE 就是编译器报 0x234
+# "当前控制器不支持当前的底盘驱动类型" 时检查的那个字段。
+
+CHASSIS_TYPE_NAMES = {
+    "2": "两驱差速", "4": "四驱差速", "6": "四驱麦克纳姆轮", "7": "单舵轮",
+    "8": "双舵轮", "9": "四舵轮", "10": "单差速总成", "11": "两驱差速舵轮",
+    "12": "双差速总成底盘", "13": "四差速总成底盘", "15": "三舵轮",
+    "16": "后驱前转向", "17": "两驱两转向", "18": "四全向轮", "19": "六舵轮",
+    "20": "八舵轮", "23": "八差速总成底盘", "25": "两差速两舵轮底盘", "99": "无",
+}
+
+
+def collect_controller_config(root: ET.Element) -> dict:
+    """Collect the controller node, wizard model data and chassis geometry.
+
+    Everything here comes from the project configuration wizard rather than the
+    control scheme, and it is what the compiler validates against the installed
+    hardware capability library.
+    """
+    controller = root.find(".//HARDWARE_ROBOT_CONTROLLER")
+    if controller is None:
+        return {}
+
+    def attrs_of(elem: ET.Element | None) -> dict[str, str]:
+        return {} if elem is None else {k: v for k, v in sorted(elem.attrib.items())}
+
+    general = controller.find("./GENERAL_CFG")
+    wizard = controller.find("./WIZARD_CONFIG")
+    navi = controller.find("./NAVI_CFG")
+
+    wheels = [attrs_of(w) for w in controller.findall("./WHEEL_CFG")]
+
+    devices = []
+    if wizard is not None:
+        for dev in wizard.findall(".//WIZARD_DEVICE"):
+            params = [attrs_of(p) for p in dev.findall("./WIZARD_DEVICE_PARAM")]
+            options = [attrs_of(o) for o in dev.iter("WIZARD_DEVICE_PARAM_OPTION")]
+            devices.append({"device": attrs_of(dev), "params": params, "options": options})
+
+    driver_type = attr(general, "CAR_DRIVER_TYPE") if general is not None else ""
+    return {
+        "controller": attrs_of(controller),
+        "controller_type": attr(controller, "TYPE"),
+        "controller_version": attr(controller, "VERSION"),
+        "general_cfg": attrs_of(general),
+        "chassis_driver_type": driver_type,
+        "chassis_driver_type_name": CHASSIS_TYPE_NAMES.get(driver_type, "未知"),
+        "wizard_config": attrs_of(wizard),
+        "navi_cfg": attrs_of(navi),
+        "wheel_cfg": wheels,
+        "wizard_devices": devices,
+        "channels": [attrs_of(c) for c in controller.findall("./HARDWARE_CHANNEL")],
+    }
+
+
+# --- 本机 xRobotDesigner 安装库 --------------------------------------------
+
+DEFAULT_INSTALL_DIRS = (
+    r"D:\KCSmart\xRobotDesigner",
+    r"C:\KCSmart\xRobotDesigner",
+)
+
+
+# ---------------------------------------------------------------------------
+# Vendor resource discovery
+#
+# xRobotDesigner ships several reference libraries that are far more reliable
+# than memory or inference: the function block library (authoritative pin names
+# and order), the data type library (vendor struct definitions), the help file,
+# and -- on some machines -- a folder of official sample projects, which are
+# GUI-authored and therefore the ground truth for file shape.
+#
+# None of these paths may be hard-coded: they differ per machine, per install
+# language, and per installed version. Resolution order is
+#     CLI flag  ->  environment variable  ->  config file  ->  built-in probing
+# and the config file is deliberately not committed (see kecon-resources.example.json).
+# ---------------------------------------------------------------------------
+
+RESOURCE_CONFIG_NAME = "kecon-resources.json"
+RESOURCE_LANGS = ("chs", "eng", "enu", "jan")
+
+
+def resource_config_candidates(explicit: str | None) -> list[Path]:
+    """Where a resource config may live, most specific first."""
+    out: list[Path] = []
+    if explicit:
+        out.append(Path(explicit))
+        return out
+    env = os.environ.get("KECON_CONFIG")
+    if env:
+        out.append(Path(env))
+    out.append(Path.cwd() / RESOURCE_CONFIG_NAME)
+    out.append(Path.home() / RESOURCE_CONFIG_NAME)
+    out.append(Path(__file__).resolve().parent.parent / RESOURCE_CONFIG_NAME)
+    return out
+
+
+def load_resource_config(explicit: str | None) -> tuple[dict, Path | None]:
+    for path in resource_config_candidates(explicit):
+        try:
+            if path.is_file():
+                return json.loads(path.read_text(encoding="utf-8")), path
+        except (OSError, ValueError) as exc:
+            print(f"WARNING: ignoring resource config {path}: {exc}")
+    return {}, None
+
+
+def installed_versions(install_dir: Path, lang: str) -> list[str]:
+    """Version folder names under Resource/<lang>/history, newest last."""
+    hist = install_dir / "Resource" / lang / "history"
+    if not hist.is_dir():
+        return []
+
+    def key(name: str) -> list[int]:
+        return [int(part) if part.isdigit() else 0 for part in name.split(".")]
+
+    return sorted((p.name for p in hist.iterdir() if p.is_dir()), key=key)
+
+
+def versioned_resource_dirs(install_dir: Path, lang: str, leaf: str, version: str | None) -> list[Path]:
+    """Candidate directories for a versioned resource, most preferred first.
+
+    `leaf` is the folder name under either Resource/<lang>/ or
+    Resource/<lang>/history/<version>/ -- for example "FBLib/MRC" or "DataType".
+    `version` may be a specific folder name, or None/"latest" for the newest.
+    """
+    base = install_dir / "Resource" / lang
+    out: list[Path] = []
+    versions = installed_versions(install_dir, lang)
+    if version and version != "latest":
+        if version in versions:
+            out.append(base / "history" / version / leaf)
+    else:
+        out.extend(base / "history" / v / leaf for v in reversed(versions))
+    out.append(base / leaf)
+    return out
+
+
+def resolve_resources(args: argparse.Namespace) -> dict:
+    """Resolve every vendor resource path this tool knows how to use."""
+    config, config_path = load_resource_config(getattr(args, "config", None))
+
+    def pick(flag: str, env: str, key: str, default=None):
+        value = getattr(args, flag, None)
+        if value:
+            return value, "flag"
+        value = os.environ.get(env)
+        if value:
+            return value, "env"
+        value = config.get(key)
+        if value:
+            return value, "config"
+        return default, "default"
+
+    lang, lang_src = pick("lang", "KECON_LANG", "lang", None)
+    version, version_src = pick("version", "KECON_VERSION", "version", "latest")
+
+    install_raw, install_src = pick("install_dir", "KECON_INSTALL_DIR", "install_dir", None)
+    install_dir: Path | None = None
+    if install_raw:
+        candidate = Path(install_raw)
+        install_dir = candidate if (candidate / "Resource").is_dir() else None
+    else:
+        for candidate in DEFAULT_INSTALL_DIRS:
+            path = Path(candidate)
+            if (path / "Resource").is_dir():
+                install_dir, install_src = path, "probe"
+                break
+
+    langs = [lang] if lang else list(RESOURCE_LANGS)
+    if install_dir is not None and not lang:
+        langs = [l for l in RESOURCE_LANGS if (install_dir / "Resource" / l).is_dir()] or list(RESOURCE_LANGS)
+
+    def first_existing(leaf: str, override_key: str, override_flag: str, override_env: str) -> Path | None:
+        raw, _ = pick(override_flag, override_env, override_key, None)
+        if raw:
+            path = Path(raw)
+            return path if path.is_dir() else None
+        if install_dir is None:
+            return None
+        for l in langs:
+            for path in versioned_resource_dirs(install_dir, l, leaf, version):
+                if path.is_dir():
+                    return path
+        return None
+
+    fb_lib = first_existing("FBLib/MRC", "fb_lib_dir", "fb_lib_dir", "KECON_FB_LIB_DIR")
+    datatype_dir = first_existing("DataType", "datatype_dir", "datatype_dir", "KECON_DATATYPE_DIR")
+
+    help_files: list[Path] = []
+    raw_help = config.get("help_files") or []
+    if isinstance(raw_help, str):
+        raw_help = [raw_help]
+    help_files.extend(Path(p) for p in raw_help)
+    if install_dir is not None:
+        for l in langs:
+            folder = install_dir / "Resource" / l / "HelpFile"
+            if folder.is_dir():
+                help_files.extend(sorted(folder.glob("*.chm")))
+                help_files.extend(sorted(folder.glob("*.pdf")))
+
+    sample_dirs_raw, samples_src = pick("samples_dir", "KECON_SAMPLES_DIR", "sample_projects", None)
+    if isinstance(sample_dirs_raw, str):
+        sample_dirs_raw = [sample_dirs_raw]
+    sample_dirs = [Path(p) for p in (sample_dirs_raw or [])]
+    samples: list[Path] = []
+    for folder in sample_dirs:
+        if folder.is_dir():
+            samples.extend(sorted(folder.rglob("*.xcskr")))
+        elif folder.is_file() and folder.suffix.lower() == ".xcskr":
+            samples.append(folder)
+
+    return {
+        "config_file": config_path,
+        "install_dir": install_dir,
+        "install_source": install_src,
+        "langs": langs,
+        "lang_source": lang_src,
+        "version": version,
+        "version_source": version_src,
+        "versions_installed": installed_versions(install_dir, langs[0]) if install_dir else [],
+        "fb_lib_dir": fb_lib,
+        "datatype_dir": datatype_dir,
+        "help_files": help_files,
+        "sample_dirs": sample_dirs,
+        "sample_dirs_source": samples_src,
+        "sample_projects": samples,
+    }
+
+
+def add_resource_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", help=f"resource config JSON; defaults to KECON_CONFIG, ./{RESOURCE_CONFIG_NAME}, ~/{RESOURCE_CONFIG_NAME}, then the one beside the skill")
+    parser.add_argument("--install-dir", help="xRobotDesigner install directory (KECON_INSTALL_DIR, or config install_dir)")
+    parser.add_argument("--lang", choices=RESOURCE_LANGS, help="resource language folder (KECON_LANG, or config lang); default is whatever is installed")
+    parser.add_argument("--version", help="library version folder under Resource/<lang>/history, or 'latest' (KECON_VERSION, or config version)")
+    parser.add_argument("--fb-lib-dir", help="override the function block library directory (KECON_FB_LIB_DIR)")
+    parser.add_argument("--datatype-dir", help="override the vendor data type library directory (KECON_DATATYPE_DIR)")
+    parser.add_argument("--samples-dir", action="append", help="folder of official sample .xcskr projects (KECON_SAMPLES_DIR, or config sample_projects); repeatable")
+
+
+def cmd_resources(args: argparse.Namespace) -> int:
+    """Report which vendor resources were found, and where each came from.
+
+    Run this first on a new machine: every other command that reads vendor
+    reference data resolves paths through the same function.
+    """
+    res = resolve_resources(args)
+
+    def mark(path) -> str:
+        if path is None:
+            return "NOT FOUND"
+        return f"{path}"
+
+    print(f"ConfigFile={mark(res['config_file'])}")
+    print(f"InstallDir={mark(res['install_dir'])} (from {res['install_source']})")
+    print(f"Langs={','.join(res['langs'])} (from {res['lang_source']})")
+    print(f"Version={res['version']} (from {res['version_source']})")
+    print(f"VersionsInstalled={','.join(res['versions_installed']) or '-'}")
+    print(f"FunctionBlockLib={mark(res['fb_lib_dir'])}")
+    if res["fb_lib_dir"] is not None:
+        blocks = load_library_function_blocks_from(res["fb_lib_dir"])
+        print(f"FunctionBlocks={len(blocks)}")
+    print(f"DataTypeLib={mark(res['datatype_dir'])}")
+    print(f"HelpFiles={len(res['help_files'])}")
+    for path in res["help_files"]:
+        print(f"  {path}")
+    print(f"SampleDirs={len(res['sample_dirs'])} (from {res['sample_dirs_source']})")
+    for path in res["sample_dirs"]:
+        print(f"  {path}")
+    print(f"SampleProjects={len(res['sample_projects'])}")
+    for path in res["sample_projects"]:
+        print(f"  {path}")
+    if res["install_dir"] is None:
+        print("WARNING: no install directory; pass --install-dir, set KECON_INSTALL_DIR, or write a config file")
+        return 1
+    return 0
+
+
+def load_datatype_library(datatype_dir: Path) -> list[dict[str, object]]:
+    """Vendor struct definitions from Resource/<lang>/.../DataType/*.xml.
+
+    These describe the chassis/system structures a project can import. Note the
+    schema differs from a project file: here it is <Struct><Member/></Struct>
+    with array sizes in the datatype string, not the expanded per-element form a
+    project's USER_STRUCT uses.
+    """
+    rows: list[dict[str, object]] = []
+    for path in sorted(datatype_dir.glob("*.xml")):
+        raw = path.read_bytes()
+        text = None
+        for enc in ("utf-8", "gbk"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            continue
+        for match in re.finditer(r"<(Struct|CfgType)\b([^>]*)>(.*?)</\1>", text, re.S):
+            head, body = match.group(2), match.group(3)
+            name = (re.search(r'name="([^"]*)"', head) or [None, ""])[1]
+            desc = (re.search(r'desc="([^"]*)"', head) or [None, ""])[1]
+            members = re.findall(r'<Member\b[^>]*name="([^"]*)"[^>]*?datatype="([^"]*)"', body)
+            rows.append({
+                "file": path.name,
+                "kind": match.group(1),
+                "name": name,
+                "desc": desc,
+                "members": len(members),
+                "member_list": ",".join(f"{n}:{d}" for n, d in members[:6]),
+            })
+    return rows
+
+
+def cmd_datatype_library(args: argparse.Namespace) -> int:
+    """List the vendor data type library that ships with the installed version."""
+    res = resolve_resources(args)
+    folder = res["datatype_dir"]
+    if folder is None:
+        print("DATATYPE_LIB=NOT FOUND")
+        print("Run `resources` to see how paths are being resolved.")
+        return 1
+    rows = load_datatype_library(folder)
+    print("DATATYPE_LIB=OK")
+    print(f"Dir={folder}")
+    print(f"Structs={len(rows)}")
+    if args.name:
+        rows = [r for r in rows if args.name.lower() in str(r["name"]).lower()]
+        print(f"Matched={len(rows)}")
+    output_rows(rows, ["file", "kind", "name", "desc", "members", "member_list"], args.format, args.output, args.output_encoding)
+    return 0
+
+
+def resolve_install_dir(explicit: str | None) -> Path | None:
+    if explicit:
+        # An explicit path is a deliberate choice: never silently fall back to a
+        # different installation when it turns out to be wrong.
+        path = Path(explicit)
+        return path if (path / "Resource").is_dir() else None
+    candidates: list[str] = []
+    env = os.environ.get("KECON_INSTALL_DIR")
+    if env:
+        candidates.append(env)
+    candidates.extend(DEFAULT_INSTALL_DIRS)
+    for candidate in candidates:
+        path = Path(candidate)
+        if (path / "Resource").is_dir():
+            return path
+    return None
+
+
+def load_controller_chassis_support(install_dir: Path) -> dict[str, list[tuple[str, str]]]:
+    """Return {controller name: [(chassis id, desc), ...]} from MRCSeries.xml."""
+    support: dict[str, list[tuple[str, str]]] = {}
+    for lang in ("chs", "eng", "enu"):
+        series = install_dir / "Resource" / lang / "Hardware" / "Common" / "MRCSeries.xml"
+        if not series.is_file():
+            continue
+        root = ET.fromstring(series.read_bytes().decode("utf-8", errors="replace"))
+        for ctrl in root.iter("Controller"):
+            name = ctrl.get("name") or ""
+            rows = [(c.get("id") or "", c.get("des") or "") for c in ctrl.iter("Chassis")]
+            if name and rows:
+                support[name] = rows
+        if support:
+            break
+    return support
+
+
+def load_controller_device_caps(install_dir: Path, controller_type: str) -> list[dict]:
+    """Return the <Config>/<Version> capability blocks for one controller model."""
+    caps: list[dict] = []
+    for lang in ("chs", "eng", "enu"):
+        device_root = install_dir / "Resource" / lang / "Hardware" / "Device"
+        if not device_root.is_dir():
+            continue
+        for lib_version in sorted(p for p in device_root.iterdir() if p.is_dir()):
+            device_file = lib_version / f"{controller_type}.xml"
+            if not device_file.is_file():
+                continue
+            root = ET.fromstring(device_file.read_bytes().decode("utf-8", errors="replace"))
+            config = root.find("./Config")
+            for version in root.iter("Version"):
+                caps.append({
+                    "lib_version": lib_version.name,
+                    "version_id": version.get("id") or "",
+                    "config": {} if config is None else dict(config.attrib),
+                    "not_supported": [f.get("name") or "" for f in version.findall("./FeatureNotSupport")],
+                    "supported": [f.get("name") or "" for f in version.findall("./FeatureSupport")],
+                })
+        if caps:
+            break
+    return caps
+
+
+def cmd_validate_controller_support(args: argparse.Namespace) -> int:
+    root = parse_xml(read_text(args.project, args.encoding))
+    cfg = collect_controller_config(root)
+    if not cfg:
+        print("CONTROLLER_SUPPORT=SKIP")
+        print("Reason=no HARDWARE_ROBOT_CONTROLLER in project")
+        return 0
+
+    controller_type = cfg["controller_type"]
+    controller_version = cfg["controller_version"]
+    driver_type = cfg["chassis_driver_type"]
+    print(f"Controller={controller_type} Version={controller_version}")
+    print(f"ChassisDriverType={driver_type} ({cfg['chassis_driver_type_name']})")
+
+    install_dir = resolve_install_dir(args.install_dir)
+    if install_dir is None:
+        print("CONTROLLER_SUPPORT=SKIP")
+        print("Reason=xRobotDesigner install directory not found; pass --install-dir")
+        return 0
+    print(f"InstallDir={install_dir}")
+
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    support = load_controller_chassis_support(install_dir)
+    if controller_type in support:
+        allowed = support[controller_type]
+        ids = [i for i, _ in allowed]
+        pretty = ", ".join(f"{i}={d}" for i, d in allowed)
+        print(f"SupportedChassis={pretty}")
+        if driver_type and driver_type not in ids:
+            problems.append(
+                f"GENERAL_CFG@CAR_DRIVER_TYPE={driver_type} ({cfg['chassis_driver_type_name']}) "
+                f"is not in the {controller_type} chassis list -> compile error 0x234 "
+                f"当前控制器不支持当前的底盘驱动类型"
+            )
+    else:
+        print(f"SupportedChassis=<{controller_type} not listed in MRCSeries.xml>")
+
+    caps = load_controller_device_caps(install_dir, controller_type)
+    match = [c for c in caps if c["version_id"] == controller_version] or caps
+    if match:
+        cap = match[0]
+        print(f"DeviceLib={cap['lib_version']} VersionId={cap['version_id']} Config={cap['config']}")
+        if cap["not_supported"]:
+            print("FeatureNotSupport=" + ", ".join(cap["not_supported"]))
+
+        tasks = [e for e in root.iter() if is_task_element(e)]
+        cycle_tasks = [e for e in tasks if e.tag == "CYCLE_TASK"]
+        event_tasks = [e for e in tasks if e.tag == "EVENT_TASK"]
+        max_cycle = cap["config"].get("max_cycle_task")
+        max_event = cap["config"].get("max_event_task")
+        if max_cycle and len(cycle_tasks) > int(max_cycle):
+            problems.append(f"cycle tasks {len(cycle_tasks)} exceed max_cycle_task={max_cycle}")
+        if max_event and len(event_tasks) > int(max_event):
+            problems.append(f"event tasks {len(event_tasks)} exceed max_event_task={max_event}")
+        if event_tasks and "EVENT_TASK" in cap["not_supported"]:
+            problems.append("project has event tasks but the controller declares them unsupported")
+
+        max_cmd = cap["config"].get("max_canopen_cmd_cnt")
+        cmd_rows = collect_canopen_command_id_rows(root, True)
+        print(f"CanopenEnabledCommands={len(cmd_rows)} Max={max_cmd or '?'}")
+        if max_cmd and len(cmd_rows) > int(max_cmd):
+            problems.append(f"enabled CANopen commands {len(cmd_rows)} exceed max_canopen_cmd_cnt={max_cmd}")
+    else:
+        print(f"DeviceLib=<no {controller_type}.xml found>")
+
+    wheel_count = cfg["general_cfg"].get("CAR_WHEEL_COUNT")
+    if wheel_count:
+        print(f"WheelCount={wheel_count} WheelCfgEntries={len(cfg['wheel_cfg'])}")
+        if len(cfg["wheel_cfg"]) != int(wheel_count):
+            problems.append(f"CAR_WHEEL_COUNT={wheel_count} but {len(cfg['wheel_cfg'])} WHEEL_CFG entries exist")
+
+    wizard_chassis = cfg["wizard_config"].get("CHASSIS_TYPE", "")
+    wizard_param = ""
+    for dev in cfg["wizard_devices"]:
+        for param in dev["params"]:
+            if param.get("NAME") == "chassis_type":
+                wizard_param = param.get("VALUE", "")
+    if wizard_param and driver_type and wizard_param != driver_type:
+        # The compiler reads GENERAL_CFG, not the wizard, so this does not block a
+        # build. It matters because re-running the configuration wizard can push
+        # the wizard value back into GENERAL_CFG and break a project that worked.
+        warnings.append(
+            f"wizard chassis_type={wizard_param} disagrees with GENERAL_CFG@CAR_DRIVER_TYPE={driver_type}; "
+            f"re-running the configuration wizard may overwrite CAR_DRIVER_TYPE and break the build"
+        )
+    print(f"WizardChassisType={wizard_chassis!r} WizardChassisTypeValue={wizard_param!r}")
+
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    if problems:
+        print("CONTROLLER_SUPPORT=FAIL")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print("CONTROLLER_SUPPORT=OK" if not warnings else "CONTROLLER_SUPPORT=OK_WITH_WARNINGS")
+    return 0
+
+
+def cmd_set_node_id(args: argparse.Namespace) -> int:
+    """Change one CANopen slave node id.
+
+    The node id lives in two attributes that must stay in sync:
+    HARDWARE_DEVICE_UPLINK_PORT@ADDRESS and HARDWARE_CAN_DEVICE_SLAVE@NODE_ID.
+    Writing only one of them leaves the project silently inconsistent, which is
+    exactly what `set-attrs --kind station --attr ADDRESS=...` used to do.
+    """
+    text = read_text(args.project, args.encoding)
+    port_start, _, port_raw, _ = find_element_span(
+        text, "HARDWARE_DEVICE_DOWNLINK_PORT", lambda a: a.get("ID") == args.port_id
+    )
+    station_start, _, station_raw, _ = find_element_span(
+        port_raw,
+        "HARDWARE_DEVICE_UPLINK_PORT",
+        lambda a: a.get("ADDRESS") == args.address,
+        offset=port_start,
+    )
+    tag_start, tag_end, _ = find_start_tag_span(
+        station_raw,
+        "HARDWARE_DEVICE_UPLINK_PORT",
+        lambda a: a.get("ADDRESS") == args.address,
+        offset=station_start,
+    )
+
+    edits: list[tuple[int, int, str]] = [
+        (tag_start, tag_end, patch_start_tag_attrs(text[tag_start:tag_end], {"ADDRESS": args.node_id}))
+    ]
+    slave_hits = 0
+    for match in re.finditer(r"<HARDWARE_CAN_DEVICE_SLAVE\b[^>]*>", station_raw):
+        start = station_start + match.start()
+        end = station_start + match.end()
+        edits.append((start, end, patch_start_tag_attrs(text[start:end], {"NODE_ID": args.node_id})))
+        slave_hits += 1
+
+    if slave_hits == 0:
+        raise ValueError("no HARDWARE_CAN_DEVICE_SLAVE under this station; is this really a CANopen port?")
+
+    patched = text
+    for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+        patched = patched[:start] + replacement + patched[end:]
+    parse_xml(patched)
+
+    summary = f"port:{args.port_id} {args.address} -> {args.node_id} (uplink=1, slave={slave_hits})"
+    if args.dry_run:
+        print("DRY_RUN=OK")
+        print(f"SetNodeId={summary}")
+        return 0
+    backup = None if args.no_backup else make_backup(args.project)
+    write_text(args.project, patched, args.encoding)
+    print(f"Backup={backup}" if backup else "Backup=SKIPPED")
+    print(f"SetNodeId={summary}")
+    return 0
+
+
 def cmd_export_ai(args: argparse.Namespace) -> int:
     text = read_text(args.project, args.encoding)
     root = parse_xml(text)
@@ -1281,6 +2315,7 @@ def cmd_export_ai(args: argparse.Namespace) -> int:
     user_structs = collect_user_structs(root)
     graphics = collect_graphic_pous(root)
     hardware = collect_hardware_package(root)
+    controller_cfg = collect_controller_config(root)
 
     index = {
         "format": "kecon-xcskr-ai-pack/v2",
@@ -1301,6 +2336,19 @@ def cmd_export_ai(args: argparse.Namespace) -> int:
             "variables": "variables.json",
             "user_data_types": "user-data-types.json",
             "graphics": "graphics.json",
+            "controller": "controller.json",
+        },
+        "controller": {
+            "type": controller_cfg.get("controller_type", ""),
+            "version": controller_cfg.get("controller_version", ""),
+            "chassis_driver_type": controller_cfg.get("chassis_driver_type", ""),
+            "chassis_driver_type_name": controller_cfg.get("chassis_driver_type_name", ""),
+            "wizard_chassis_type": controller_cfg.get("wizard_config", {}).get("CHASSIS_TYPE", ""),
+            "wizard_path": controller_cfg.get("wizard_config", {}).get("PATH", ""),
+            "wheel_count": controller_cfg.get("general_cfg", {}).get("CAR_WHEEL_COUNT", ""),
+            "wheel_cfg_entries": len(controller_cfg.get("wheel_cfg", [])),
+            "car_length_mm": controller_cfg.get("general_cfg", {}).get("CAR_LENGTH", ""),
+            "car_width_mm": controller_cfg.get("general_cfg", {}).get("CAR_WIDTH", ""),
         },
         "counts": {
             "tasks": len(control["tasks"]),
@@ -1337,6 +2385,7 @@ def cmd_export_ai(args: argparse.Namespace) -> int:
     }
 
     write_json(output_dir / "index.json", index)
+    write_json(output_dir / "controller.json", controller_cfg)
     write_json(output_dir / "programs.json", {"programs": control["programs"]})
     write_json(output_dir / "function-blocks.json", {"function_blocks": function_blocks})
     write_json(output_dir / "functions.json", {"functions": functions})
@@ -1420,6 +2469,17 @@ def patch_selected_attrs(text: str, args: argparse.Namespace, updates: dict[str,
     elif args.kind == "hardware-tag":
         start, end, _ = find_start_tag_span(text, "HARDWARE_CHANNEL_TAG", lambda attrs_map: attrs_map.get("NAME") == args.name)
         target = f"hardware-tag:{args.name}"
+    elif args.kind == "cmd-group":
+        # A CANopen object needs BOTH halves flipped to go live: the channel tag
+        # (kind=hardware-tag, ENABLE) and the command group that transmits it
+        # (this kind, HARDWARE_GROUP_ENABLE).  Enabling only the tag leaves a
+        # variable that never moves -- no error anywhere.  The group is keyed by
+        # HARDWARE_CMD_TAG_NAME, which is the generated name and stays put even
+        # after the channel tag itself is renamed.
+        start, end, _ = find_start_tag_span(
+            text, "HARDWARE_CAN_CMD_GROUP",
+            lambda attrs_map: attrs_map.get("HARDWARE_CMD_TAG_NAME") == args.name)
+        target = f"cmd-group:{args.name}"
     elif args.kind == "user-struct":
         start, end, _ = find_start_tag_span(text, "USER_STRUCT", lambda attrs_map: attrs_map.get("NAME") == args.struct)
         target = f"user-struct:{args.struct}"
@@ -1465,6 +2525,11 @@ def patch_selected_attrs(text: str, args: argparse.Namespace, updates: dict[str,
         )
         start, end = local_start, local_end
         target = f"station:{args.port_id}:{args.address or args.name}"
+        if any(item.split("=", 1)[0].strip().upper() == "ADDRESS" for item in args.attr):
+            raise ValueError(
+                "a CANopen node id lives in both HARDWARE_DEVICE_UPLINK_PORT@ADDRESS and "
+                "HARDWARE_CAN_DEVICE_SLAVE@NODE_ID; use `set-node-id` so both stay in sync"
+            )
     elif args.kind == "slave-object":
         if not args.port_id or not args.index:
             raise ValueError("--port-id and --index are required for slave-object")
@@ -1538,6 +2603,14 @@ def patch_selected_attrs(text: str, args: argparse.Namespace, updates: dict[str,
 
 def cmd_set_attrs(args: argparse.Namespace) -> int:
     updates = parse_attr_updates(args.attr)
+    if args.kind == "hardware-tag" and "NAME" in updates:
+        # Renaming here would touch the start tag and nothing else, leaving the
+        # child VARIABLE_MEMBER entries under the old prefix.  Programs address
+        # the members (`Tag[0]`, `Tag[1]`), so the tag would look renamed while
+        # every reference to it stopped resolving.
+        raise ValueError(
+            "hardware-tag 的 NAME 不能用 set-attrs 改：子成员 VARIABLE_MEMBER 会留在旧名字下，"
+            "程序引用的正是子成员。请用 rename-hardware-tag。")
     text = read_text(args.project, args.encoding)
     new_text, target = patch_selected_attrs(text, args, updates)
     parse_xml(new_text)
@@ -1550,6 +2623,54 @@ def cmd_set_attrs(args: argparse.Namespace) -> int:
     write_text(args.project, new_text, args.encoding)
     print(f"Backup={backup}" if backup else "Backup=SKIPPED")
     print(f"SetAttrs={target}")
+    return 0
+
+
+
+def cmd_rename_hardware_tag(args: argparse.Namespace) -> int:
+    """Rename a HARDWARE_CHANNEL_TAG together with everything named after it.
+
+    Three places carry the name and all three have to move as one:
+      - `HARDWARE_CHANNEL_TAG@NAME`
+      - every child `VARIABLE_MEMBER@NAME` (`Tag[0]`, `Tag[1]`, ...) -- these are
+        what ST code actually references
+      - `HARDWARE_CAN_CMD_GROUP@HARDWARE_CMD_TAG_NAME`, which is how the command
+        group finds its tag
+
+    Renaming only the first leaves a project that still parses and still
+    compiles, but whose members are unreachable under the new name.
+    """
+    text = read_text(args.project, args.encoding)
+    old, new = args.old, args.new
+    if old == new:
+        raise ValueError("--old 与 --new 相同，无事可做")
+    if re.search(r'<HARDWARE_CHANNEL_TAG[^>]*NAME="%s"' % re.escape(new), text):
+        raise ValueError("已存在名为 %s 的硬件标签" % new)
+
+    start, end, raw = find_element_span(
+        text, "HARDWARE_CHANNEL_TAG",
+        lambda attrs_map: attrs_map.get("NAME") == old)[0:3]
+    body = text[start:end]
+    renamed = body.replace('"%s"' % old, '"%s"' % new)
+    renamed = renamed.replace('"%s[' % old, '"%s[' % new)
+    members = renamed.count('"%s[' % new)
+    text = text[:start] + renamed + text[end:]
+
+    groups = 0
+    pattern = 'HARDWARE_CMD_TAG_NAME="%s"' % old
+    if pattern in text:
+        groups = text.count(pattern)
+        text = text.replace(pattern, 'HARDWARE_CMD_TAG_NAME="%s"' % new)
+
+    parse_xml(text)
+    if args.dry_run:
+        print("DRY_RUN=OK")
+        print("Renamed=%s -> %s members=%d groups=%d" % (old, new, members, groups))
+        return 0
+    backup = None if args.no_backup else make_backup(args.project)
+    write_text(args.project, text, args.encoding)
+    print(f"Backup={backup}" if backup else "Backup=SKIPPED")
+    print("Renamed=%s -> %s members=%d groups=%d" % (old, new, members, groups))
     return 0
 
 
@@ -2063,11 +3184,17 @@ def cmd_add_user_struct_member(args: argparse.Namespace) -> int:
             print(f"WARNING: {member['NAME']}: {note}")
 
     new_text = text
+    step = indent_step(text)
     for member in members:
+        # An array member is written expanded, one child per element -- the shape
+        # the GUI writes and the one both official sample projects use. A flat
+        # self-closing member declares the same type and compiles, but the
+        # editor counts and lays out members per element, so its member list and
+        # offset column would disagree with the declaration.
         new_text = insert_container_child(
             new_text,
             "USER_STRUCT",
-            lambda indent, member=member: indent + xml_start_tag("USER_STRUCT_MEMBER", member, True),
+            lambda indent, member=member: render_struct_array_member(member, indent, step),
             predicate=lambda attrs_map: attrs_map.get("NAME") == args.struct,
         )
 
@@ -2076,6 +3203,118 @@ def cmd_add_user_struct_member(args: argparse.Namespace) -> int:
         print(f"WARNING: variables using {args.struct} still hold the old member tree: {', '.join(users)}")
         print("WARNING: run rebuild-variable-members for each of them before compiling")
     return finish_write(args, new_text, f"AddedStructMembers={args.struct} count={len(members)}")
+
+
+def struct_array_members(root: ET.Element) -> list[dict[str, object]]:
+    """Every USER_STRUCT array member, and whether it is expanded per element.
+
+    The GUI writes an array member of a user data type as a parent element with
+    one child per element:
+
+        <USER_STRUCT_MEMBER DATATYPE="BOOL[8]" DESC="" INIT_VALUE="" NAME="b" VISIBLE="YES">
+            <USER_STRUCT_MEMBER DATATYPE="BOOL" DESC="" NAME="b[0]" VISIBLE="YES"/>
+            ...
+        </USER_STRUCT_MEMBER>
+
+    A self-closing parent with no children declares the same type and still
+    compiles, but the editor's member list and offset column are driven by the
+    child elements, so a flat member makes those displays disagree with the
+    declared layout.  Both official sample projects expand every array member
+    (4 of 4), and the help states a user data type holds at most 1024 members
+    while counting "one array member with 1024 elements" as reaching that limit
+    -- the GUI's accounting is per element throughout.
+    """
+    rows: list[dict[str, object]] = []
+    for struct in root.findall(".//USER_DATA_TYPE/USER_STRUCT"):
+        for member in struct.findall("./USER_STRUCT_MEMBER"):
+            match = ARRAY_DATATYPE_RE.match(member.get("DATATYPE", ""))
+            if not match:
+                continue
+            size = int(match.group(2))
+            kids = member.findall("./USER_STRUCT_MEMBER")
+            rows.append({
+                "struct": struct.get("NAME", ""),
+                "member": member.get("NAME", ""),
+                "datatype": member.get("DATATYPE", ""),
+                "elements": size,
+                "children": len(kids),
+                "expanded": "YES" if len(kids) == size else "NO",
+            })
+    return rows
+
+
+def render_struct_array_member(attrs: dict[str, str], indent: str, step: str) -> str:
+    """The GUI's shape for one array member: parent tag plus one child per element."""
+    match = ARRAY_DATATYPE_RE.match(attrs.get("DATATYPE", ""))
+    if not match:
+        return indent + xml_start_tag("USER_STRUCT_MEMBER", attrs, True)
+    base, size = match.group(1), int(match.group(2))
+    name = attrs.get("NAME", "")
+    lines = [indent + xml_start_tag("USER_STRUCT_MEMBER", attrs, False)]
+    for i in range(size):
+        # Children carry no INIT_VALUE, matching what the GUI writes.
+        child = {"DATATYPE": base, "DESC": "", "NAME": f"{name}[{i}]", "VISIBLE": "YES"}
+        lines.append(indent + step + xml_start_tag("USER_STRUCT_MEMBER", child, True))
+    lines.append(indent + "</USER_STRUCT_MEMBER>")
+    return "\n".join(lines)
+
+
+def cmd_rebuild_user_struct_members(args: argparse.Namespace) -> int:
+    """Expand every array member of a user data type into per-element children.
+
+    Safe to re-run: a member already expanded with the right element count is
+    left byte-for-byte alone.
+    """
+    text = read_text(args.project, args.encoding)
+    step = indent_step(text)
+
+    root = parse_xml(text)
+    names = [s.get("NAME", "") for s in root.findall(".//USER_DATA_TYPE/USER_STRUCT")]
+    if args.struct:
+        if args.struct not in names:
+            raise ValueError(f"USER_STRUCT {args.struct!r} not found")
+        names = [args.struct]
+
+    changed: list[str] = []
+    new_text = text
+    for struct_name in names:
+        # Work inside this struct's own span so a member name that also exists
+        # in another struct cannot be hit by accident.
+        s_start, s_end, s_raw, _ = find_element_span(
+            new_text, "USER_STRUCT", lambda a: a.get("NAME") == struct_name
+        )
+        span = s_raw
+        while True:
+            sub_root = parse_xml(span)
+            todo = None
+            for member in sub_root.findall("./USER_STRUCT_MEMBER"):
+                match = ARRAY_DATATYPE_RE.match(member.get("DATATYPE", ""))
+                if not match:
+                    continue
+                if len(member.findall("./USER_STRUCT_MEMBER")) != int(match.group(2)):
+                    todo = member.get("NAME", "")
+                    break
+            if todo is None:
+                break
+            m_start, m_end, _, attrs = find_element_span(
+                span, "USER_STRUCT_MEMBER", lambda a: a.get("NAME") == todo
+            )
+            line_start = span.rfind("\n", 0, m_start) + 1
+            indent = span[line_start:m_start]
+            block = render_struct_array_member(attrs, indent, step)
+            span = span[:m_start] + block[len(indent):] + span[m_end:]
+            changed.append(f"{struct_name}.{todo}")
+        if span != s_raw:
+            new_text = new_text[:s_start] + span + new_text[s_end:]
+
+    if not changed:
+        print("RebuiltUserStructMembers=0 (every array member was already expanded)")
+        return 0
+    return finish_write(
+        args,
+        new_text,
+        "RebuiltUserStructMembers=" + str(len(changed)) + " members=" + ",".join(changed),
+    )
 
 
 def cmd_add_variable(args: argparse.Namespace) -> int:
@@ -2199,25 +3438,145 @@ def cmd_remove_entity(args: argparse.Namespace) -> int:
     return finish_write(args, new_text, f"Removed={args.kind}:{key}")
 
 
+# Byte width of each elementary type inside a struct, and the boundary the
+# editor aligns a member of that type to.
+#
+# The bit widths come from the official help topic "系统数据类型" (BOOL 1,
+# BYTE/SINT/USINT 8, WORD/INT/UINT 16, DWORD/DINT/UDINT/REAL/TIME 32).
+#
+# Two things that table does not say, both *verified 2026-08-21* against the
+# offsets the editor displays for real structs:
+#
+#   1. A BOOL takes a whole byte, not a bit. In a struct laid out REAL x5,
+#      DINT x3, UINT x2, BOOL[16], BOOL[8], BOOL[8] the editor reported
+#      0x22 / 0x24 / 0x34 / 0x3C for the last UINT and the three BOOL arrays,
+#      which matches one byte per BOOL and rules out bit packing (that would
+#      have given 0x24 / 0x26 / 0x27).
+#
+#   2. Members are naturally aligned -- each one starts on a multiple of its own
+#      width, with padding inserted before it as needed. In a struct whose
+#      members run BYTE x5, BOOL, BOOL, UINT, BOOL x8, UINT, UINT, BYTE, DINT,
+#      the editor put that DINT at 0x18: packing with no padding would have put
+#      it at 0x16, so the two byte gaps (before the first UINT, and before the
+#      DINT) are real.
+STRUCT_MEMBER_BYTES = {
+    "BOOL": 1,
+    "BYTE": 1, "SINT": 1, "USINT": 1,
+    "WORD": 2, "INT": 2, "UINT": 2,
+    "DWORD": 4, "DINT": 4, "UDINT": 4, "REAL": 4, "TIME": 4,
+}
+
+
+def struct_layout_rows(root: ET.Element, struct_name: str | None) -> tuple[list[dict[str, object]], dict[str, int]]:
+    """Byte offset of every member of every user data type.
+
+    Offsets are not stored in the project file -- the editor computes them from
+    the declared types, so this reproduces that computation: members in
+    declaration order, each aligned to its own width, an array occupying
+    element_count * element_size bytes and aligned to its element width.
+
+    The reported struct size rounds the end up to the widest member's alignment,
+    which is the usual rule for an array of structs to stay aligned. That last
+    step is an assumption -- the editor shows member offsets but no total, so
+    there is nothing to check it against.
+    """
+    rows: list[dict[str, object]] = []
+    totals: dict[str, int] = {}
+    for struct in root.findall(".//USER_DATA_TYPE/USER_STRUCT"):
+        name = struct.get("NAME", "")
+        if struct_name and name != struct_name:
+            continue
+        offset = 0
+        widest = 1
+        for member in struct.findall("./USER_STRUCT_MEMBER"):
+            datatype = member.get("DATATYPE", "")
+            match = ARRAY_DATATYPE_RE.match(datatype)
+            base, count = (match.group(1), int(match.group(2))) if match else (datatype, 1)
+            size = STRUCT_MEMBER_BYTES.get(base)
+            if size is None:
+                # A nested user type. The help says nesting is not allowed, so
+                # this is a malformed member rather than something to size, and
+                # every offset after it would be a guess.
+                rows.append({
+                    "struct": name, "member": member.get("NAME", ""), "datatype": datatype,
+                    "elements": count, "bytes": "?", "offset": "?", "offset_hex": "?",
+                    "desc": member.get("DESC", ""),
+                })
+                break
+            padding = (-offset) % size
+            offset += padding
+            widest = max(widest, size)
+            rows.append({
+                "struct": name,
+                "member": member.get("NAME", ""),
+                "datatype": datatype,
+                "elements": count,
+                "bytes": size * count,
+                "pad": padding,
+                "offset": offset,
+                "offset_hex": f"0x{offset:04X}",
+                "desc": member.get("DESC", ""),
+            })
+            offset += size * count
+        totals[name] = offset + ((-offset) % widest)
+    return rows, totals
+
+
+def cmd_struct_layout(args: argparse.Namespace) -> int:
+    """Show the byte offsets the GUI displays for user data type members."""
+    root = parse_xml(read_text(args.project, args.encoding))
+    rows, totals = struct_layout_rows(root, args.struct)
+    if not rows:
+        print("STRUCT_LAYOUT=EMPTY")
+        return 1
+    print("STRUCT_LAYOUT=OK")
+    for name, size in totals.items():
+        print(f"Struct={name} Bytes={size}")
+    output_rows(rows, ["struct", "member", "datatype", "elements", "bytes", "pad", "offset", "offset_hex", "desc"],
+                args.format, args.output, args.output_encoding)
+    return 0
+
+
 def cmd_validate_datatypes(args: argparse.Namespace) -> int:
     root = parse_xml(read_text(args.project, args.encoding))
     structs = collect_struct_defs(root)
     rows: list[dict[str, object]] = []
     problems = 0
 
+    flat_arrays = {
+        (row["struct"], row["member"]): row
+        for row in struct_array_members(root)
+        if row["expanded"] == "NO"
+    }
+
     for struct_name, members in structs.items():
         for member in members:
             base, _, _ = parse_datatype(member["datatype"])
             known = base in BASE_DATATYPES or base in structs
+            status = "OK"
+            detail = ""
             if not known:
                 problems += 1
+                status = "UNKNOWN_TYPE"
+                detail = f"base {base} is neither elementary nor a USER_STRUCT"
+            elif (struct_name, member["name"]) in flat_arrays:
+                # Not a compile error, but the GUI's member accounting is per
+                # element, so a flat array member shows a member list and offset
+                # column that disagree with the declared type.
+                row = flat_arrays[(struct_name, member["name"])]
+                problems += 1
+                status = "ARRAY_NOT_EXPANDED"
+                detail = (
+                    f"{row['elements']} elements declared but {row['children']} child members; "
+                    "run rebuild-user-struct-members"
+                )
             rows.append(
                 {
                     "entity": "user-struct-member",
                     "name": f"{struct_name}.{member['name']}",
                     "datatype": member["datatype"],
-                    "status": "OK" if known else "UNKNOWN_TYPE",
-                    "detail": "" if known else f"base {base} is neither elementary nor a USER_STRUCT",
+                    "status": status,
+                    "detail": detail,
                 }
             )
 
@@ -3119,9 +4478,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-backup", action="store_true")
     p.set_defaults(func=cmd_replace_st)
 
+    p = sub.add_parser("rename-hardware-tag", help="rename a hardware channel tag together with its members and command group")
+    add_common_project_arg(p)
+    p.add_argument("--old", required=True)
+    p.add_argument("--new", required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(func=cmd_rename_hardware_tag)
+
     p = sub.add_parser("set-attrs", help="set attributes on selected structured project entities without hand-editing XML")
     add_common_project_arg(p)
-    p.add_argument("--kind", required=True, choices=["variable", "hardware-tag", "user-struct", "user-struct-member", "pou", "pou-var", "task", "trig-condition", "block", "downlink-port", "station", "slave-object", "slave-mapping"])
+    p.add_argument("--kind", required=True, choices=["variable", "hardware-tag", "user-struct", "user-struct-member", "pou", "pou-var", "task", "trig-condition", "block", "downlink-port", "station", "slave-object", "slave-mapping", "cmd-group"])
     p.add_argument("--name", help="entity name, or POU name for kind=pou/pou-var")
     p.add_argument("--pou-type", choices=sorted(POU_TAGS), help="required for kind=pou or kind=pou-var")
     p.add_argument("--var-section", choices=["input", "output", "internal"], help="required for kind=pou-var")
@@ -3188,6 +4555,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--show-all", action="store_true", help="print all checked rows when validation passes")
     p.set_defaults(func=cmd_validate_canopen_command_ids)
 
+    p = sub.add_parser("alloc-canopen-command-ids", help="assign a command id to every enabled CANopen command group that lacks one")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(func=cmd_alloc_canopen_command_ids)
+
+    p = sub.add_parser("validate-hardware-bindings", help="check every enabled CANopen command group points at an existing, enabled channel tag")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--show-all", action="store_true", help="print all enabled bindings when validation passes")
+    p.set_defaults(func=cmd_validate_hardware_bindings)
+
+    p = sub.add_parser("validate-command-directions", help="check enabled CANopen output commands are actually written by a program, and inputs are not")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--show-all", action="store_true", help="print all enabled command groups when validation passes")
+    p.set_defaults(func=cmd_validate_command_directions)
+
+    p = sub.add_parser("validate-fb-calls", help="check every function block call lists its pins in declaration order")
+    add_common_project_arg(p)
+    add_output_args(p)
+    add_resource_args(p)
+    p.set_defaults(func=cmd_validate_fb_calls)
+
+    p = sub.add_parser("resources", help="report which vendor reference resources were found and where each came from")
+    add_resource_args(p)
+    p.set_defaults(func=cmd_resources)
+
+    p = sub.add_parser("datatype-library", help="list the vendor data type library shipped with the installed version")
+    add_resource_args(p)
+    add_output_args(p)
+    p.add_argument("--name", help="only structs whose name contains this text")
+    p.set_defaults(func=cmd_datatype_library)
+
+    p = sub.add_parser("validate-controller-support", help="cross-check chassis driver type, task and CANopen limits against the installed xRobotDesigner library")
+    add_common_project_arg(p)
+    p.add_argument("--install-dir", help="xRobotDesigner install directory; defaults to KECON_INSTALL_DIR then D:/KCSmart/xRobotDesigner")
+    p.set_defaults(func=cmd_validate_controller_support)
+
+    p = sub.add_parser("set-node-id", help="change a CANopen slave node id in both places that hold it")
+    add_common_project_arg(p)
+    p.add_argument("--port-id", required=True, help="downlink port ID, from list-downlinks")
+    p.add_argument("--address", required=True, help="current node id")
+    p.add_argument("--node-id", required=True, help="new node id")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(func=cmd_set_node_id)
+
     p = sub.add_parser("export-graphic", help="export LD/FBD graphical logic: blocks, pins, connections, lines, comments")
     add_common_project_arg(p)
     add_output_args(p)
@@ -3242,6 +4658,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-backup", action="store_true")
     p.set_defaults(func=cmd_add_variable)
 
+    p = sub.add_parser("rebuild-user-struct-members", help="expand USER_STRUCT array members into per-element children, the shape the GUI writes")
+    add_common_project_arg(p)
+    p.add_argument("--struct", help="only this user data type; default is every one")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(func=cmd_rebuild_user_struct_members)
+
     p = sub.add_parser("rebuild-variable-members", help="regenerate a VARIABLE member tree from its DATATYPE and the current USER_STRUCT definitions")
     add_common_project_arg(p)
     p.add_argument("--name", required=True)
@@ -3260,6 +4683,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-backup", action="store_true")
     p.set_defaults(func=cmd_remove_entity)
+
+    p = sub.add_parser("struct-layout", help="byte offsets of user data type members, as the GUI computes them")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--struct", help="only this user data type")
+    p.set_defaults(func=cmd_struct_layout)
 
     p = sub.add_parser("validate-datatypes", help="check VARIABLE / USER_STRUCT datatypes and member tree consistency")
     add_common_project_arg(p)

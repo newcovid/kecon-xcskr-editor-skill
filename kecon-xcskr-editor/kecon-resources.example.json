@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Copy this file to kecon-resources.json and edit the paths for your machine.",
+    "kecon-resources.json is git-ignored on purpose: these paths are per-machine",
+    "and often personal, so they must never be committed.",
+    "",
+    "Resolution order for every value below is:",
+    "  CLI flag  ->  environment variable  ->  this file  ->  built-in probing",
+    "so any single value can be overridden without editing the file.",
+    "",
+    "Run `python scripts/xcskr_tool.py resources` to see what was resolved and",
+    "which source each value came from.",
+    "",
+    "Every key is optional. Omit a key to let the tool derive or probe it."
+  ],
+
+  "install_dir": "D:/KCSmart/xRobotDesigner",
+  "_install_dir": "xRobotDesigner install root, the folder containing Resource/. Env: KECON_INSTALL_DIR. Probed from a short list of common install paths when absent.",
+
+  "lang": "chs",
+  "_lang": "Resource language folder: chs | eng | enu | jan. Env: KECON_LANG. When absent, every installed language is searched in that order.",
+
+  "version": "latest",
+  "_version": "Version folder under Resource/<lang>/history, or \"latest\". Env: KECON_VERSION. Pin it to reproduce results against one library version.",
+
+  "fb_lib_dir": null,
+  "_fb_lib_dir": "Override the function block library folder (…/FBLib/MRC). Env: KECON_FB_LIB_DIR. Normally derived from install_dir + lang + version. This library is the authority on function block pin names and order.",
+
+  "datatype_dir": null,
+  "_datatype_dir": "Override the vendor data type library folder (…/DataType). Env: KECON_DATATYPE_DIR. Holds the chassis and system struct definitions a project can import.",
+
+  "help_files": [],
+  "_help_files": "Extra help files to record, e.g. manuals kept outside the install. The Resource/<lang>/HelpFile folder is picked up automatically. The .chm can be unpacked with 7-Zip; its topic pages are GBK-encoded HTML.",
+
+  "sample_projects": [],
+  "_sample_projects": "Folders (searched recursively) or single .xcskr files holding official sample projects. Env: KECON_SAMPLES_DIR. These are GUI-authored, which makes them the ground truth for file shape whenever the tool has to reproduce something the GUI writes."
+}

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.bak_*
+.venv/
+help-cache/
+.cache/
+
+# 本机资源路径（每台机器不同，且常含个人目录），只提交 .example.json
+kecon-resources.json

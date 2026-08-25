@@ -22,7 +22,11 @@ xRobotDesigner `.xcskr` PLC 工程。
 - 图形逻辑：引脚绑定变量、两引脚连线、拆线、从参考工程复制功能块。
 - 替换 ST，保留该 POU 或工程原有的换行编码风格。
 - 定点修改变量、POU、硬件标签、CAN/CANopen 对象和映射属性。
-- 创建时间戳备份，并提供 ST 格式、数据类型、CANopen 命令 ID 静态检查。
+- 重命名硬件标签时，同时移动它的 `VARIABLE_MEMBER` 成员树和命令组引用——ST 引用的是成员。
+- 给启用的 CANopen 命令组补发命令号。GUI 勾选时会自动发号，直接改 XML 不会；
+  少了号编译器不报命令组，而是报引用该标签的**程序**「字符串无法识别」并算在第 1 行。
+- 创建时间戳备份，并提供 ST 格式、数据类型、命令方向、功能块调用引脚、
+  CANopen 命令 ID 等静态检查。
 
 ### 写入保真
 
@@ -34,6 +38,38 @@ XML 结构约定不是从单个工程猜的，而是与 xRobotDesigner 随附的
 详见 [`references/xcskr-structure.md`](kecon-xcskr-editor/references/xcskr-structure.md)
 和 [`references/ld-fbd-st.md`](kecon-xcskr-editor/references/ld-fbd-st.md)。
 
+## 文本工作区：在 GUI 之外编辑
+
+xRobotDesigner 的编辑器不能改字体、字号和配色，工程一大就很难写。
+`xcskr_workspace.py` 把工程摊成一棵文本目录：每个 POU 一个 `.st`，图形 POU 一个
+`.graph.json`，另有只读的变量表、结构体表和符号表。改完一次性回灌，单次写入并自动备份。
+
+```powershell
+python scripts\xcskr_workspace.py export-workspace --project P --workspace W
+python scripts\xcskr_workspace.py import-workspace --project P --workspace W --dry-run
+python scripts\xcskr_workspace.py import-workspace --project P --workspace W
+python scripts\xcskr_workspace.py check-workspace  --project P --workspace W
+```
+
+四条拒绝构成它的安全边界：工程在导出之后被改过（GUI 保存会整份覆盖文件）、
+导出会冲掉尚未回灌的编辑（这些文件会先存进 `_ws/.discarded/`）、工作区文件被改名、
+以及图形改动超出「引脚绑定 / 初值 / 取反、块停用、连线增删」的范围--
+块的 `TYPE` 隐含一张文件里没有的固定引脚表，所以新块只能用 `copy-block` 从参考工程复制。
+
+`check-workspace` 把各项校验的结果输出成 `file:line:col`，可直接接编辑器的问题面板。
+
+## 本机路径配置
+
+安装目录、帮助文件和样例工程的位置每台机器都不同，任何一处都不写死在代码里。
+解析顺序是 **命令行参数 -> 环境变量 -> 配置文件 -> 内置探测**。
+
+```powershell
+Copy-Item kecon-xcskr-editor\kecon-resources.example.json kecon-xcskr-editor\kecon-resources.json
+python scripts\xcskr_tool.py resources          # 看每个值最终取自哪里
+```
+
+`kecon-resources.json` 已在 `.gitignore` 中，**不要提交**--它记录的是个人目录结构。
+
 ## 仓库结构
 
 ```text
@@ -42,9 +78,13 @@ kecon-xcskr-editor-skill/
 ├── .gitignore
 └── kecon-xcskr-editor/
     ├── SKILL.md
+    ├── kecon-resources.example.json   本机路径示例，复制成 kecon-resources.json 后使用
     ├── agents/
     ├── references/
     ├── scripts/
+    │   ├── xcskr_tool.py              读写工程与静态检查
+    │   ├── xcskr_workspace.py         文本工作区导出/回灌
+    │   └── kecon_help.py              本机帮助原文检索
     └── tests/
 ```
 
