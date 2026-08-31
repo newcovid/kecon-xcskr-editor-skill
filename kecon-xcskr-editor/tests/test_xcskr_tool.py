@@ -133,12 +133,33 @@ FIXTURE_XML = """<?xml version="1.0" encoding="GBK"?>
             </HARDWARE_CAN_DEVICE_MOTOR>
           </HARDWARE_DEVICE_UPLINK_PORT>
         </HARDWARE_NET>
+        <HARDWARE_PROPERTY ID="CAN_BAUD" VALUE="0x04" />
       </HARDWARE_DEVICE_DOWNLINK_PORT>
       <HARDWARE_DEVICE_DOWNLINK_PORT ID="8" NAME="CAN4" DISPLAY="CAN2" PHYSICAL_ID="67" PROTOCOL="4" TYPE="5">
-        <HARDWARE_CAN_SLAVER_OBJECT INDEX="8192" DESC="Status_TPDO" DATATYPE="uint32" ARRAY_FLAG="YES" ARRAY_SIZE="2" ENABLE="YES" PDO_INDEX="6656" PDO_DESC="Transmit PDO 1">
+        <HARDWARE_CAN_SLAVER_OBJECT INDEX="8192" DESC="StatusTPDO" DATATYPE="uint32" ARRAY_FLAG="YES" ARRAY_SIZE="2" ENABLE="YES" PDO_INDEX="6656" PDO_DESC="Transmit PDO 1">
           <HARDWARE_MODBUS_TAG_MAPPING OFFSET="0" TAG_NAME="StatusWords[0]" />
           <HARDWARE_MODBUS_TAG_MAPPING OFFSET="1" TAG_NAME="StatusWords[1]" />
         </HARDWARE_CAN_SLAVER_OBJECT>
+      </HARDWARE_DEVICE_DOWNLINK_PORT>
+      <HARDWARE_DEVICE_DOWNLINK_PORT ID="11" NAME="COM2" DISPLAY="RS485-2" PHYSICAL_ID="82" PROTOCOL="1" TYPE="6" MODE="0" ADDRESS="0">
+        <HARDWARE_NET>
+          <HARDWARE_DEVICE_UPLINK_PORT ADDRESS="9" NAME="BatteryBms">
+            <HARDWARE_OTHER_DEVICE_RTU>
+              <HARDWARE_COM_CMD DEV_TYPE="0" ID="251" TYPE="0">
+                <HARDWARE_CHANNEL_TAG NAME="Rt_0001" DATATYPE="UINT[2]" DESC="realtime block" ENABLE="YES" INIT_VALUE="" READONLY="NO" VISIBLE="YES">
+                  <VARIABLE_MEMBER NAME="Rt_0001[0]" DATATYPE="UINT" DESC="" INIT_VALUE="0" VISIBLE="YES" />
+                  <VARIABLE_MEMBER NAME="Rt_0001[1]" DATATYPE="UINT" DESC="" INIT_VALUE="0" VISIBLE="YES" />
+                </HARDWARE_CHANNEL_TAG>
+                <HARDWARE_FLAG_TAG NAME="Rt_0001_F" DATATYPE="BOOL" DESC="" ENABLE="YES" INIT_VALUE="OFF" VISIBLE="YES" />
+                <HARDWARE_PROPERTY ID="COM_CMD_CYCLE" VALUE="200" />
+                <HARDWARE_PROPERTY ID="COM_CMD_FC" VALUE="3" />
+                <HARDWARE_PROPERTY ID="COM_CMD_START_ADDR" VALUE="1" />
+                <HARDWARE_PROPERTY ID="COM_CMD_NUMBER" VALUE="2" />
+              </HARDWARE_COM_CMD>
+            </HARDWARE_OTHER_DEVICE_RTU>
+          </HARDWARE_DEVICE_UPLINK_PORT>
+        </HARDWARE_NET>
+        <HARDWARE_PROPERTY ID="COM_BAUD" VALUE="12" />
       </HARDWARE_DEVICE_DOWNLINK_PORT>
     </HARDWARE_NET>
   </HARDWARE>
@@ -406,6 +427,57 @@ class XcskrToolTests(unittest.TestCase):
             run_tool("rebuild-variable-members", "--project", str(project), "--name", "Wheel", "--no-backup")
             fixed = run_tool("validate-datatypes", "--project", str(project), "--strict")
             self.assertIn("Problems=0", fixed.stdout)
+
+    @staticmethod
+    def set_element_desc(project: Path, member: str, desc: str) -> None:
+        """Write a DESC onto one VARIABLE_MEMBER, the way the GUI lets a person."""
+        text = project.read_text(encoding="gbk")
+        pattern = re.compile(r'<VARIABLE_MEMBER\b[^>]*?NAME="%s"[^>]*?>' % re.escape(member))
+        match = pattern.search(text)
+        assert match is not None, "no such member: " + member
+        tag = match.group(0)
+        new_tag = re.sub(r'DESC="[^"]*"', 'DESC="%s"' % desc, tag, count=1)
+        project.write_text(text[:match.start()] + new_tag + text[match.end():], encoding="gbk")
+
+    def test_rebuild_variable_members_keeps_per_element_desc(self) -> None:
+        # An array element's description exists only on the variable -- the
+        # struct definition has nowhere to record it.  A rebuild regenerates the
+        # member tree from that definition, so without carrying the text across
+        # it comes back empty, silently: the project still compiles and runs,
+        # and the loss only shows as a blank column in the variable monitor much
+        # later.  Adding one struct member is enough to force the rebuild.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool("add-user-struct", "--project", str(project), "--name", "AlarmData",
+                     "--member", "Active:BOOL[4]", "--no-backup")
+            run_tool("add-variable", "--project", str(project), "--name", "Alm",
+                     "--datatype", "AlarmData", "--no-backup")
+            self.set_element_desc(project, "Alm.Active[2]", "drive 3 offline")
+
+            run_tool("add-user-struct-member", "--project", str(project), "--struct", "AlarmData",
+                     "--member", "Count:BYTE", "--no-backup")
+            rebuilt = run_tool("rebuild-variable-members", "--project", str(project),
+                               "--name", "Alm", "--no-backup")
+
+            self.assertIn("keptDesc=1", rebuilt.stdout)
+            after = project.read_text(encoding="gbk")
+            self.assertIn("drive 3 offline", after)
+            self.assertIn('NAME="Alm.Count"', after)
+
+    def test_rebuild_variable_members_can_be_told_to_drop_element_desc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool("add-user-struct", "--project", str(project), "--name", "AlarmData",
+                     "--member", "Active:BOOL[4]", "--no-backup")
+            run_tool("add-variable", "--project", str(project), "--name", "Alm",
+                     "--datatype", "AlarmData", "--no-backup")
+            self.set_element_desc(project, "Alm.Active[2]", "drive 3 offline")
+
+            rebuilt = run_tool("rebuild-variable-members", "--project", str(project),
+                               "--name", "Alm", "--drop-element-desc", "--no-backup")
+
+            self.assertIn("keptDesc=0", rebuilt.stdout)
+            self.assertNotIn("drive 3 offline", project.read_text(encoding="gbk"))
 
     def test_add_variable_rejects_name_and_datatype_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -707,12 +779,61 @@ class XcskrToolTests(unittest.TestCase):
 
             self.assertIn("FB_CALLS=OK", result.stdout)
 
+    def test_validate_array_index_flags_a_bit_string_subscript(self) -> None:
+        # BOOL/BYTE/WORD/DWORD are bit strings in IEC 61131-3, not numbers.
+        # Subscripting with one is refused: 文本"["错误，数组的索引值不是整数,
+        # plus a follow-on 匹配变量表达式失败 on the same statement.  BYTE is
+        # the tempting type for a ring buffer pointer, and it compares against
+        # an integer without complaint, so nothing warns before the compiler.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            self.put_st(project, "MainProgram", "StatusWords[SystemReady] := 1;")
+
+            result = run_tool("validate-array-index", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("BIT_STRING", result.stdout)
+            self.assertIn("SystemReady", result.stdout)
+
+    def test_validate_array_index_accepts_integer_and_literal_subscripts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            self.put_st(project, "MainProgram", "StatusWords[0] := StatusWords[1];")
+
+            result = run_tool("validate-array-index", "--project", str(project), check=False)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("ARRAY_INDEX=OK", result.stdout)
+
+    def test_validate_array_index_ignores_comments_and_reports_the_real_line(self) -> None:
+        # Two traps in one: a subscript written inside a comment must not be
+        # reported, and the line number has to come from the raw attribute --
+        # a literal line break inside an XML attribute value is normalized to
+        # a space by any conforming parser, so reading CONTENT through
+        # ElementTree collapses the POU to one line and every finding lands on
+        # line 1.
+        body = (
+            "StatusWords[0] := 0;\n"
+            "(* StatusWords[SystemReady] would be refused *)\n"
+            "StatusWords[SystemReady] := 1;\n"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            self.put_st(project, "MainProgram", body)
+
+            result = run_tool("validate-array-index", "--project", str(project), check=False)
+
+            self.assertIn("Problems=1", result.stdout)
+            offending = [line for line in result.stdout.splitlines() if "BIT_STRING" in line]
+            self.assertEqual(len(offending), 1)
+            self.assertIn(" 3 ", offending[0])
+
     def test_validate_canopen_command_ids_flags_an_enabled_group_without_an_id(self) -> None:
         # xRobotDesigner allocates the command id when the group is ticked in
         # the GUI.  A group enabled by editing the XML goes live without one,
         # and the compiler then blames the PROGRAMS that use the tag
         # (文本"<tag>"错误，字符串无法识别) instead of the group -- 216 errors
-        # from 27 such groups on IVC300, 2026-08-25.
+        # from 27 such groups on IVC300,.
         with tempfile.TemporaryDirectory() as temp:
             project = self.make_project(Path(temp))
             raw = project.read_text(encoding="gbk", newline="")
@@ -736,6 +857,330 @@ class XcskrToolTests(unittest.TestCase):
             result = run_tool("validate-canopen-command-ids", "--project", str(project), check=False)
 
             self.assertIn("CANOPEN_COMMAND_IDS=OK", result.stdout)
+
+    def test_validate_slave_objects_passes_on_a_clean_dictionary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("validate-slave-objects", "--project", str(project), check=False)
+
+            self.assertIn("SLAVE_OBJECTS=OK", result.stdout)
+            self.assertIn("Port8Mappings=2/63", result.stdout)
+
+    def test_validate_slave_objects_flags_an_illegal_name(self) -> None:
+        # The GUI refuses a slave object name that is empty, longer than 15
+        # characters, or holds anything but ASCII letters and digits.  A name
+        # written past the GUI compiles and downloads, and the controller then
+        # builds no dictionary at all -- every SDO read aborts 0x06020000 and
+        # no TPDO is sent (measured).
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            raw = raw.replace('DESC="StatusTPDO"', 'DESC="Status_Word_0_7_SDO"')
+            project.write_text(raw, encoding="gbk", newline="")
+
+            result = run_tool("validate-slave-objects", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SLAVE_OBJECTS=FAIL", result.stdout)
+            self.assertIn("max 15", result.stdout)
+
+    def test_validate_slave_objects_flags_a_datatype_outside_the_dropdown(self) -> None:
+        # The dropdown says "boolean"; "bool" is accepted by a text edit and by
+        # the compiler, and is not a value the runtime knows.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            raw = raw.replace('DATATYPE="uint32" ARRAY_FLAG="YES" ARRAY_SIZE="2"',
+                              'DATATYPE="bool" ARRAY_FLAG="YES" ARRAY_SIZE="2"')
+            project.write_text(raw, encoding="gbk", newline="")
+
+            result = run_tool("validate-slave-objects", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not one of the GUI dropdown values", result.stdout)
+
+    def test_validate_slave_objects_flags_a_port_over_the_mapping_budget(self) -> None:
+        # 63 bound variables work, 64 kill the whole dictionary -- bisected on
+        # real hardware.  Object count, byte total and sub-index
+        # count were each ruled out along the way.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            extra = "".join(
+                f'<HARDWARE_MODBUS_TAG_MAPPING OFFSET="{i}" TAG_NAME="StatusWords[0]" />'
+                for i in range(2, 64)
+            )
+            raw = raw.replace("</HARDWARE_CAN_SLAVER_OBJECT>", extra + "</HARDWARE_CAN_SLAVER_OBJECT>")
+            project.write_text(raw, encoding="gbk", newline="")
+
+            result = run_tool("validate-slave-objects", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SLAVE_OBJECTS=FAIL", result.stdout)
+            self.assertIn("Port8Mappings=64/63", result.stdout)
+
+    NL = chr(10)
+
+    def with_st(self, folder, body: str):
+        """Fixture with one program's ST replaced by `body`."""
+        project = self.make_project(folder)
+        raw = project.read_text(encoding="gbk", newline="")
+        start = raw.index("<SECTION_LOGIC_ST CONTENT=\"")
+        head = raw.index("\"", start + len("<SECTION_LOGIC_ST CONTENT=")) + 1
+        tail = raw.index("\"", head)
+        encoded = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        encoded = encoded.replace(chr(34), "&quot;").replace(chr(10), "&#x0D;&#x0A;")
+        raw = raw[:head] + encoded + raw[tail:]
+        project.write_text(raw, encoding="gbk", newline="")
+        return project
+
+    def test_validate_comment_balance_accepts_a_closed_multiline_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.with_st(Path(temp),
+                "(* a comment" + self.NL + "   spanning lines *)" + self.NL + "    Speed := 3;" + self.NL)
+
+            result = run_tool("validate-comment-balance", "--project", str(project))
+
+            self.assertIn("COMMENT_BALANCE=OK", result.stdout)
+
+    def test_validate_comment_balance_flags_a_comment_that_eats_the_next_statement(self) -> None:
+        # A missing *) runs the comment on to the next end-of-line comment and
+        # takes that whole statement with it.  Not a syntax error, compiles and
+        # downloads fine, and the only symptom is one assignment that never
+        # happened -- observed on 5.1.0 three programs downstream.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.with_st(Path(temp),
+                "(* forgot to close this one" + self.NL
+                + "    Speed := 3;                 (* target speed *)" + self.NL)
+
+            result = run_tool("validate-comment-balance", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SWALLOWED_CODE", result.stdout)
+            self.assertIn("Speed := 3", result.stdout)
+
+    def test_validate_comment_balance_flags_a_comment_left_open_at_the_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.with_st(Path(temp), "    Speed := 3;" + self.NL + "(* trailing prose" + self.NL)
+
+            result = run_tool("validate-comment-balance", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("UNCLOSED", result.stdout)
+
+    MODBUS_PORT = (
+        '<HARDWARE_DEVICE_DOWNLINK_PORT ID="20" NAME="ETH1" PROTOCOL="2" MODE="1">'
+        "{quotes}"
+        '<HARDWARE_PROPERTY ID="TCP_LOCAL_PORT" VALUE="502" />'
+        "</HARDWARE_DEVICE_DOWNLINK_PORT>"
+    )
+
+    def make_modbus_project(self, folder: Path, windows, quoted=None, extra_vars: str = "") -> Path:
+        """Fixture plus a Modbus TCP server port quoting the given windows.
+
+        ``windows`` is a list of (name, start, end, [tag, ...]); OFFSET is
+        assigned by position, which is how a generator naturally writes it and
+        exactly how the address clash arises.
+        """
+        project = self.make_project(folder)
+        raw = project.read_text(encoding="gbk", newline="")
+        body = "".join(
+            '<HARDWARE_MODBUS_MAPPING NAME="{}" START_ADDR="{}" END_ADDR="{}">{}</HARDWARE_MODBUS_MAPPING>'.format(
+                name, start, end,
+                "".join('<HARDWARE_MODBUS_TAG_MAPPING OFFSET="{}" TAG_NAME="{}"/>'.format(i, tag)
+                        for i, tag in enumerate(tags)))
+            for name, start, end, tags in windows)
+        raw = raw.replace("<TAGCONFIG/>", "<TAGCONFIG>" + body + "</TAGCONFIG>")
+        names = [w[0] for w in windows] if quoted is None else quoted
+        quotes = "".join('<HARDWARE_MODBUS_MAPPING_QUOTE NAME="{}"/>'.format(n) for n in names)
+        raw = raw.replace("</HARDWARE>", self.MODBUS_PORT.format(quotes=quotes) + "</HARDWARE>")
+        if extra_vars:
+            raw = raw.replace("</GLOBAL_TAG_CONFIG>", extra_vars + "</GLOBAL_TAG_CONFIG>")
+        project.write_text(raw, encoding="gbk", newline="")
+        return project
+
+    def test_validate_modbus_mapping_accepts_matching_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_modbus_project(Path(temp), [
+                ("MODBUS_10001_10016_0", 10001, 10016, ["SystemReady"]),
+                ("MODBUS_30001_30016_0", 30001, 30016, ["StatusWords[0]", "StatusWords[1]"]),
+            ])
+
+            result = run_tool("validate-modbus-mapping", "--project", str(project))
+
+            self.assertIn("MODBUS_MAPPING=OK", result.stdout)
+            self.assertIn("Windows=2", result.stdout)
+
+    def test_validate_modbus_mapping_flags_a_wide_tag_in_a_bit_space(self) -> None:
+        # A discrete-input address is one bit, so a 16-bit tag eats sixteen of
+        # them and every OFFSET after it is wrong.  The compiler rejects the
+        # project with 位号地址存在重叠 and names the window, not the tag --
+        # verified on 5.1.0 with a BYTE in this position.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_modbus_project(Path(temp), [
+                ("MODBUS_10001_10064_0", 10001, 10064,
+                 ["StatusWords[0]", "SystemReady"]),
+            ])
+
+            result = run_tool("validate-modbus-mapping", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TOO_WIDE", result.stdout)
+            # The tag after it is the one whose address actually collides.
+            self.assertIn("OFFSET_CLASH", result.stdout)
+            self.assertIn("expected OFFSET 16", result.stdout)
+
+    def test_validate_modbus_mapping_flags_a_wide_tag_in_a_register_space(self) -> None:
+        # A 32-bit value needs two registers and nothing in the files says
+        # whether the next OFFSET then steps by one or by two, so it is refused
+        # rather than guessed at.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_modbus_project(
+                Path(temp),
+                [("MODBUS_30001_30016_0", 30001, 30016, ["Odometer"])],
+                extra_vars='<VARIABLE NAME="Odometer" DATATYPE="UDINT" DESC="" INIT_VALUE="0" READONLY="NO" VISIBLE="YES" />',
+            )
+
+            result = run_tool("validate-modbus-mapping", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TOO_WIDE", result.stdout)
+            self.assertIn("UDINT", result.stdout)
+
+    def test_validate_modbus_mapping_flags_a_one_byte_tag_in_a_register_space(self) -> None:
+        # Compile error 0x22D: 变量长度小于 2 字节或不是偶数字节，无法关联寄存器
+        # 地址.  A register is two bytes, so BOOL/BYTE/SINT need an INT copy --
+        # the same DISP-style copy that wide types need, for the opposite reason.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_modbus_project(
+                Path(temp),
+                [("MODBUS_30001_30016_0", 30001, 30016, ["StateCode"])],
+                extra_vars='<VARIABLE NAME="StateCode" DATATYPE="BYTE" DESC="" INIT_VALUE="0" READONLY="NO" VISIBLE="YES" />',
+            )
+
+            result = run_tool("validate-modbus-mapping", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TOO_NARROW", result.stdout)
+            self.assertIn("0x22D", result.stdout)
+
+    def test_validate_modbus_mapping_flags_a_quote_with_no_window(self) -> None:
+        # The port carries only the name; the window lives under TAGCONFIG.
+        # Clobber the window and the file is still well-formed XML, every tool
+        # still reports success, and the mapping is simply not there.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_modbus_project(
+                Path(temp),
+                [("MODBUS_10001_10016_0", 10001, 10016, ["SystemReady"])],
+                quoted=["MODBUS_10001_10016_0", "MODBUS_30001_30192_0"],
+            )
+
+            result = run_tool("validate-modbus-mapping", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("WINDOW_MISSING", result.stdout)
+            self.assertIn("MODBUS_30001_30192_0", result.stdout)
+
+    def test_validate_modbus_mapping_flags_a_window_wider_than_its_span(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_modbus_project(Path(temp), [
+                ("MODBUS_30001_30002_0", 30001, 30002,
+                 ["StatusWords[0]", "StatusWords[1]", "StatusWords[0]"]),
+            ])
+
+            result = run_tool("validate-modbus-mapping", "--project", str(project), check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("WINDOW_TOO_SMALL", result.stdout)
+
+    def test_set_attrs_routes_a_port_property_to_its_child_element(self) -> None:
+        # A port keeps its baud rate in <HARDWARE_PROPERTY ID="CAN_BAUD" VALUE=..>,
+        # not on its own start tag.  Writing it onto the tag passes every
+        # text-level check and leaves the controller on the old rate, so the
+        # value has to land on the child element (verified on hardware
+        #).
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "downlink-port",
+                              "--port-id", "5", "--attr", "CAN_BAUD=0x02", "--no-backup")
+
+            self.assertIn("downlink-port:5:CAN_BAUD", result.stdout)
+            raw = project.read_text(encoding="gbk", newline="")
+            self.assertIn('<HARDWARE_PROPERTY ID="CAN_BAUD" VALUE="0x02" />', raw)
+            port_tag = raw[raw.index('<HARDWARE_DEVICE_DOWNLINK_PORT ID="5"'):]
+            port_tag = port_tag[:port_tag.index(">")]
+            self.assertNotIn("CAN_BAUD", port_tag)
+
+    def test_set_attrs_still_writes_a_real_port_attribute_onto_the_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "downlink-port",
+                              "--port-id", "5", "--attr", "DISPLAY=CAN-A", "--no-backup")
+
+            self.assertIn("downlink-port:5", result.stdout)
+            raw = project.read_text(encoding="gbk", newline="")
+            port_tag = raw[raw.index('<HARDWARE_DEVICE_DOWNLINK_PORT ID="5"'):]
+            port_tag = port_tag[:port_tag.index(">")]
+            self.assertIn('DISPLAY="CAN-A"', port_tag)
+
+    def test_set_attrs_refuses_to_mix_a_port_property_with_a_tag_attribute(self) -> None:
+        # The two live in different elements; one call cannot patch both.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "downlink-port",
+                              "--port-id", "5", "--attr", "CAN_BAUD=0x02", "--attr", "DISPLAY=CAN-A",
+                              "--no-backup", check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            raw = project.read_text(encoding="gbk", newline="")
+            self.assertIn('VALUE="0x04"', raw)
+
+    def test_set_attrs_routes_a_com_cmd_property_to_its_child_element(self) -> None:
+        # A Modbus master command keeps its first register in
+        # <HARDWARE_PROPERTY ID="COM_CMD_START_ADDR" VALUE=..>, the same way a
+        # port keeps its baud rate.  Writing it onto the HARDWARE_COM_CMD start
+        # tag passes every text-level check and polls the old register.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "com-cmd",
+                              "--cmd-id", "251", "--attr", "COM_CMD_START_ADDR=2", "--no-backup")
+
+            self.assertIn("com-cmd:251:COM_CMD_START_ADDR", result.stdout)
+            raw = project.read_text(encoding="gbk", newline="")
+            self.assertIn('<HARDWARE_PROPERTY ID="COM_CMD_START_ADDR" VALUE="2" />', raw)
+            cmd_tag = raw[raw.index('<HARDWARE_COM_CMD '):]
+            cmd_tag = cmd_tag[:cmd_tag.index(">")]
+            self.assertNotIn("COM_CMD_START_ADDR", cmd_tag)
+
+    def test_set_attrs_still_writes_a_real_com_cmd_attribute_onto_the_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "com-cmd",
+                              "--cmd-id", "251", "--attr", "DEV_TYPE=1", "--no-backup")
+
+            self.assertIn("com-cmd:251", result.stdout)
+            raw = project.read_text(encoding="gbk", newline="")
+            cmd_tag = raw[raw.index('<HARDWARE_COM_CMD '):]
+            cmd_tag = cmd_tag[:cmd_tag.index(">")]
+            self.assertIn('DEV_TYPE="1"', cmd_tag)
+
+    def test_set_attrs_refuses_to_mix_a_com_cmd_property_with_a_tag_attribute(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "com-cmd",
+                              "--cmd-id", "251", "--attr", "COM_CMD_FC=4", "--attr", "DEV_TYPE=1",
+                              "--no-backup", check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            raw = project.read_text(encoding="gbk", newline="")
+            self.assertIn('<HARDWARE_PROPERTY ID="COM_CMD_FC" VALUE="3" />', raw)
 
     def test_alloc_canopen_command_ids_fills_enabled_groups_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1184,6 +1629,52 @@ class XcskrToolTests(unittest.TestCase):
             result = run_tool("validate-hardware-bindings", "--project", str(project), check=False)
             self.assertEqual(result.returncode, 1)
             self.assertIn("EnabledGroupWithDisabledTag=1", result.stdout)
+
+    def test_desc_within_the_limit_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("validate-desc-length", "--project", str(project))
+
+            self.assertIn("Problems=0", result.stdout)
+            self.assertIn("OverBytes=0", result.stdout)
+
+    def test_desc_longer_than_the_limit_is_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace('DESC="system ready flag"', 'DESC="%s"' % ("x" * 129)),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-desc-length", "--project", str(project), "--strict", check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Problems=1", result.stdout)
+            self.assertIn("TOO_LONG", result.stdout)
+            self.assertIn("SystemReady", result.stdout)
+
+    def test_desc_over_the_limit_only_in_gbk_bytes_is_a_warning(self) -> None:
+        """CJK doubles in GBK, so 100 characters can be 180 bytes on disk.
+
+        Whether the GUI counts characters or bytes is unverified, so this
+        stays a warning: it must not fail --strict, but it must be visible.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            text = project.read_text(encoding="gbk")
+            project.write_text(
+                text.replace('DESC="system ready flag"', 'DESC="%s"' % ("中" * 100)),
+                encoding="gbk",
+            )
+
+            result = run_tool("validate-desc-length", "--project", str(project), "--strict")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Problems=0", result.stdout)
+            self.assertIn("OverBytes=1", result.stdout)
+            self.assertIn("OVER_BYTES", result.stdout)
 
     def test_cli_help_is_generic(self) -> None:
         result = run_tool("--help")

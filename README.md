@@ -25,8 +25,27 @@ xRobotDesigner `.xcskr` PLC 工程。
 - 重命名硬件标签时，同时移动它的 `VARIABLE_MEMBER` 成员树和命令组引用——ST 引用的是成员。
 - 给启用的 CANopen 命令组补发命令号。GUI 勾选时会自动发号，直接改 XML 不会；
   少了号编译器不报命令组，而是报引用该标签的**程序**「字符串无法识别」并算在第 1 行。
-- 创建时间戳备份，并提供 ST 格式、数据类型、命令方向、功能块调用引脚、
-  CANopen 命令 ID 等静态检查。
+- 创建时间戳备份。
+
+### 静态检查
+
+写进去能编译、能下载、能运行，但在别处出问题的那一类，都做成了校验器。
+`check-workspace` 一次跑完并输出成 `file:line:col`：
+
+| 检查 | 它挡住的是 |
+|---|---|
+| `validate-datatypes` | 结构体改过之后，变量的成员树没跟着重建 |
+| `validate-st-format` | 多语句 ST 缺少原始 XML 换行，GUI 里显示成一行 |
+| `validate-canopen-command-ids` | 命令号重复；`alloc-canopen-command-ids` 给启用了却没号的补发 |
+| `validate-hardware-bindings` | 命令组指向的通道标签不存在或没启用 |
+| `validate-slave-objects` | 从站对象名、数据类型、绑定预算三项 GUI 才校验的限制 |
+| `validate-command-directions` | 读从站数据的命令组被留成了输出命令 -- 导入 EDS 会静默改回去 |
+| `validate-fb-calls` | 功能块调用的实参顺序与声明顺序不一致 |
+| `validate-desc-length` | 超长 DESC。XML 收，GUI 下次打开那个字段就再也保存不了 |
+| `validate-array-index` | 位串当数组下标 |
+| `validate-comment-balance` | 没闭合的 `(*` 把后面整段代码吃掉，编译不报错 |
+| `validate-modbus-mapping` | 映射窗口里标签宽度与地址空间对不上，编译只报窗口名不报标签 |
+| `validate-controller-support` | 用了本型号控制器不支持的功能 |
 
 ### 写入保真
 

@@ -81,6 +81,17 @@ BASE_DATATYPES = {
     "STRING", "WSTRING",
 }
 
+# An array subscript has to be an integer.  BOOL/BYTE/WORD/DWORD/LWORD are bit
+# strings in IEC 61131-3, not numbers, and REAL/LREAL are not integers either;
+# using one as a subscript is rejected by the compiler.
+BITSTRING_DATATYPES = {"BOOL", "BYTE", "WORD", "DWORD", "LWORD"}
+FLOAT_DATATYPES = {"REAL", "LREAL"}
+INTEGER_DATATYPES = {"SINT", "USINT", "INT", "UINT", "DINT", "UDINT", "LINT", "ULINT"}
+
+ST_COMMENT_RE = re.compile(r"\(\*.*?\*\)", re.DOTALL)
+ST_SUBSCRIPT_RE = re.compile(r"\[([^\[\]]+)\]")
+ST_LEADING_NAME_RE = re.compile(r"^\(*\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)")
+
 # Attribute defaults observed on GUI-created nodes.  Attribute order in the file is
 # alphabetical, which is what xml_start() reproduces.
 VARIABLE_DEFAULT_ATTRS = {
@@ -156,6 +167,8 @@ FUNCTION_BLOCK_DEFAULT_ATTRS = {
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ARRAY_DATATYPE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(\d+)\s*(?:\.\.\s*(\d+)\s*)?\]\s*$")
+# Strips a concrete subscript so `SAF.Laser[2]` resolves against the symbol table.
+ARRAY_SUBSCRIPT_RE = re.compile(r"\[\s*\d+\s*\]")
 MAX_GENERATED_MEMBERS = 20000
 
 
@@ -962,7 +975,7 @@ def cmd_validate_canopen_command_ids(args: argparse.Namespace) -> int:
     program that touches the tag with 文本"<tag>"错误，字符串无法识别 plus one
     无法识别引脚连接的变量 per pin, all reported on 第1行 no matter where the
     reference really is.  Nothing points at the command group.
-    Verified 2026-08-25 on IVC300: 27 enabled 6083/6084 groups with an empty id
+    Verified on IVC300: 27 enabled 6083/6084 groups with an empty id
     produced 216 such errors; the 5 sibling groups that still carried a stale id
     compiled untouched.  Fix with alloc-canopen-command-ids.
     """
@@ -1156,6 +1169,67 @@ def cmd_validate_hardware_bindings(args: argparse.Namespace) -> int:
     print(f"EnabledGroups={len(enabled)}")
     if args.show_all:
         output_rows(enabled, columns, args.format, args.output, args.output_encoding)
+    return 0
+
+
+# CANopen slave object dictionary limits, measured on real hardware.
+# Every one of these is enforced by the GUI only.  A project edited outside the
+# GUI can violate them, compile, download and emit its boot-up frame, while the
+# dictionary the controller actually builds is empty: every SDO read aborts with
+# 0x06020000 and no TPDO is ever transmitted.
+SLAVE_OBJECT_NAME_MAX = 15
+SLAVE_OBJECT_DATATYPES = {"uint8", "uint16", "uint32", "int8", "int16", "int32", "boolean", "real"}
+SLAVE_OBJECT_MAPPING_MAX = 63
+
+
+def cmd_validate_slave_objects(args: argparse.Namespace) -> int:
+    root = parse_xml(read_text(args.project, args.encoding))
+    rows = collect_slave_object_rows(root, args.port_id)
+    problems: list[dict[str, object]] = []
+
+    def flag(row: dict[str, object], why: str) -> None:
+        bad = dict(row)
+        bad["problem"] = why
+        problems.append(bad)
+
+    for row in rows:
+        name = str(row["desc"])
+        if not name:
+            flag(row, "name is empty")
+        elif len(name) > SLAVE_OBJECT_NAME_MAX:
+            flag(row, f"name is {len(name)} chars, max {SLAVE_OBJECT_NAME_MAX}")
+        elif not name.isascii() or not name.isalnum():
+            flag(row, "name may hold only ASCII letters and digits")
+        datatype = str(row["datatype"])
+        if datatype and datatype not in SLAVE_OBJECT_DATATYPES:
+            flag(row, f"datatype {datatype!r} is not one of the GUI dropdown values")
+
+    budgets: dict[str, int] = {}
+    for row in rows:
+        if row["enable"] != "YES" or row["port_enable"] == "NO":
+            continue
+        port = str(row["port_id"])
+        budgets[port] = budgets.get(port, 0) + int(row["mappings"])
+
+    over = {p: n for p, n in budgets.items() if n > SLAVE_OBJECT_MAPPING_MAX}
+    columns = ["port_id", "hex", "desc", "datatype", "array", "enable", "mappings", "problem"]
+
+    if problems or over:
+        print("SLAVE_OBJECTS=FAIL")
+        print(f"Checked={len(rows)}")
+        for port in sorted(budgets):
+            mark = "  <-- over limit" if port in over else ""
+            print(f"Port{port}Mappings={budgets[port]}/{SLAVE_OBJECT_MAPPING_MAX}{mark}")
+        if problems:
+            output_rows(problems, columns, args.format, args.output, args.output_encoding)
+        return 1
+
+    print("SLAVE_OBJECTS=OK")
+    print(f"Checked={len(rows)}")
+    for port in sorted(budgets):
+        print(f"Port{port}Mappings={budgets[port]}/{SLAVE_OBJECT_MAPPING_MAX}")
+    if args.show_all:
+        output_rows(rows, columns[:-1], args.format, args.output, args.output_encoding)
     return 0
 
 
@@ -2434,6 +2508,39 @@ def find_element_span(text: str, tag: str, predicate, offset: int = 0) -> tuple[
     raise ValueError(f"{tag} matching selector not found")
 
 
+# A downlink port keeps its baud rate, termination and serial framing in
+# <HARDWARE_PROPERTY ID=".." VALUE=".."/> children, not on its own start tag.
+# Writing one of these onto the start tag is accepted by every text-level check
+# and by the GUI, while the value the controller actually reads never moves --
+# so set-attrs routes them to the child element instead (verified:
+# a CAN_BAUD written onto the tag left the port running at its old rate).
+PORT_PROPERTY_IDS = frozenset({
+    "CAN_BAUD",
+    "CAN_BAUD2",
+    "CAN_TERMINAL_R",
+    "CAN_BUS_RESET",
+    "CAN_PORT",
+    "COM_BAUD",
+    "COM_DATABITS",
+    "ROBOT_COM_PARITY",
+    "ROBOT_COM_STOPBITS",
+    "TCP_LOCAL_PORT",
+})
+
+
+# A Modbus RTU master command keeps its poll period, function code, first
+# register and register count the same way a port keeps its baud rate: in
+# <HARDWARE_PROPERTY ID=".." VALUE=".."/> children.  Writing one onto the
+# HARDWARE_COM_CMD start tag is accepted everywhere and changes nothing the
+# runtime reads, so set-attrs routes them to the child element instead.
+COM_CMD_PROPERTY_IDS = frozenset({
+    "COM_CMD_CYCLE",
+    "COM_CMD_FC",
+    "COM_CMD_START_ADDR",
+    "COM_CMD_NUMBER",
+})
+
+
 def patch_start_tag_attrs(start_tag: str, updates: dict[str, str]) -> str:
     patched = start_tag
     for key, value in updates.items():
@@ -2509,8 +2616,59 @@ def patch_selected_attrs(text: str, args: argparse.Namespace, updates: dict[str,
     elif args.kind == "downlink-port":
         if not args.port_id:
             raise ValueError("--port-id is required for downlink-port")
-        start, end, _ = find_start_tag_span(text, "HARDWARE_DEVICE_DOWNLINK_PORT", lambda attrs_map: attrs_map.get("ID") == args.port_id)
-        target = f"downlink-port:{args.port_id}"
+        prop_keys = sorted(k for k in updates if k in PORT_PROPERTY_IDS)
+        if prop_keys:
+            if len(prop_keys) != len(updates):
+                raise ValueError(
+                    "mix of port properties and start-tag attributes in one call; "
+                    "they live in different elements -- run set-attrs once per group"
+                )
+            if len(prop_keys) != 1:
+                raise ValueError(
+                    "one port property per call: each has its own HARDWARE_PROPERTY element"
+                )
+            key = prop_keys[0]
+            port_start, _, port_raw, _ = find_element_span(
+                text, "HARDWARE_DEVICE_DOWNLINK_PORT", lambda attrs_map: attrs_map.get("ID") == args.port_id
+            )
+            local_start, local_end, _ = find_start_tag_span(
+                port_raw, "HARDWARE_PROPERTY", lambda attrs_map: attrs_map.get("ID") == key, offset=port_start
+            )
+            start, end = local_start, local_end
+            updates = {"VALUE": updates[key]}
+            target = f"downlink-port:{args.port_id}:{key}"
+        else:
+            start, end, _ = find_start_tag_span(text, "HARDWARE_DEVICE_DOWNLINK_PORT", lambda attrs_map: attrs_map.get("ID") == args.port_id)
+            target = f"downlink-port:{args.port_id}"
+    elif args.kind == "com-cmd":
+        if not args.cmd_id:
+            raise ValueError("--cmd-id is required for com-cmd")
+        prop_keys = sorted(k for k in updates if k in COM_CMD_PROPERTY_IDS)
+        if prop_keys:
+            if len(prop_keys) != len(updates):
+                raise ValueError(
+                    "mix of command properties and start-tag attributes in one call; "
+                    "they live in different elements -- run set-attrs once per group"
+                )
+            if len(prop_keys) != 1:
+                raise ValueError(
+                    "one command property per call: each has its own HARDWARE_PROPERTY element"
+                )
+            key = prop_keys[0]
+            cmd_start, _, cmd_raw, _ = find_element_span(
+                text, "HARDWARE_COM_CMD", lambda attrs_map: attrs_map.get("ID") == args.cmd_id
+            )
+            local_start, local_end, _ = find_start_tag_span(
+                cmd_raw, "HARDWARE_PROPERTY", lambda attrs_map: attrs_map.get("ID") == key, offset=cmd_start
+            )
+            start, end = local_start, local_end
+            updates = {"VALUE": updates[key]}
+            target = f"com-cmd:{args.cmd_id}:{key}"
+        else:
+            start, end, _ = find_start_tag_span(
+                text, "HARDWARE_COM_CMD", lambda attrs_map: attrs_map.get("ID") == args.cmd_id
+            )
+            target = f"com-cmd:{args.cmd_id}"
     elif args.kind == "station":
         if not args.port_id:
             raise ValueError("--port-id is required for station")
@@ -2795,6 +2953,29 @@ def check_datatype(datatype: str, structs: dict[str, list[dict[str, str]]], allo
     raise ValueError(message + " (use --allow-unknown-datatype to force)")
 
 
+def harvest_member_descs(raw: str) -> dict[str, str]:
+    """Map ``NAME`` -> ``DESC`` for every ``VARIABLE_MEMBER`` inside one span.
+
+    A rebuild regenerates the member tree from the struct definition, and a
+    struct definition has nowhere to record a *per-element* description -- an
+    array member expands to ``X[0]``..``X[n]`` only on the variable.  Without
+    carrying these across, a rebuild returns every element description to the
+    empty string, silently: the project still compiles and runs, and the loss
+    shows up much later as an empty column in the variable monitor.
+    """
+    try:
+        elem = ET.fromstring(raw)
+    except ET.ParseError:
+        return {}
+    kept: dict[str, str] = {}
+    for member in elem.iter("VARIABLE_MEMBER"):
+        name = member.get("NAME") or ""
+        desc = member.get("DESC") or ""
+        if name and desc:
+            kept[name] = desc
+    return kept
+
+
 def render_variable_member(
     name: str,
     datatype: str,
@@ -2810,6 +2991,7 @@ def render_variable_member(
     depth: int = 0,
     counter: list[int] | None = None,
     step: str = "    ",
+    preserve_desc: dict[str, str] | None = None,
 ) -> str:
     """Render one VARIABLE_MEMBER subtree.
 
@@ -2837,6 +3019,11 @@ def render_variable_member(
     if init_value == AUTO_INIT:
         init_value = "" if (count is not None or base in structs) else TYPE_DEFAULT_INIT.get(base, "")
         attrs["INIT_VALUE"] = init_value
+    # The struct definition is the source of truth for a field's description, so
+    # a generated one always wins.  An array element has no such source and comes
+    # out blank; that is where the harvested text goes back in.
+    if not attrs["DESC"] and preserve_desc:
+        attrs["DESC"] = preserve_desc.get(name, "")
     if is_array_element and readonly is not None:
         attrs["READONLY"] = readonly
 
@@ -2857,6 +3044,7 @@ def render_variable_member(
                     depth=depth + 1,
                     counter=counter,
                     step=step,
+                    preserve_desc=preserve_desc,
                 )
             )
     elif base in structs:
@@ -2876,6 +3064,7 @@ def render_variable_member(
                     depth=depth + 1,
                     counter=counter,
                     step=step,
+                    preserve_desc=preserve_desc,
                 )
             )
 
@@ -2904,6 +3093,7 @@ def render_variable_children(
     cold_retain: str = "NO",
     readonly: str | None = None,
     step: str = "    ",
+    preserve_desc: dict[str, str] | None = None,
 ) -> tuple[str, int]:
     counter = [0]
     base, count, low = parse_datatype(datatype)
@@ -2923,6 +3113,7 @@ def render_variable_children(
                     readonly=readonly,
                     counter=counter,
                     step=step,
+                    preserve_desc=preserve_desc,
                 )
             )
     elif base in structs:
@@ -2941,6 +3132,7 @@ def render_variable_children(
                     readonly=readonly,
                     counter=counter,
                     step=step,
+                    preserve_desc=preserve_desc,
                 )
             )
     return "\n".join(children), counter[0]
@@ -3402,6 +3594,7 @@ def cmd_rebuild_variable_members(args: argparse.Namespace) -> int:
     start_tag = start_tag_match.group(0)
     open_tag = start_tag.rstrip()[:-2].rstrip() + ">" if start_tag.rstrip().endswith("/>") else start_tag
 
+    preserve = {} if args.drop_element_desc else harvest_member_descs(raw)
     body, generated = render_variable_children(
         args.name,
         datatype,
@@ -3412,13 +3605,19 @@ def cmd_rebuild_variable_members(args: argparse.Namespace) -> int:
         cold_retain=attrs.get("COLD_RETAIN", "NO"),
         readonly=resolve_member_readonly(root, args.member_readonly),
         step=indent_step(text),
+        preserve_desc=preserve,
     )
     if body:
         replacement = open_tag + "\n" + body + "\n" + indent + "</VARIABLE>"
     else:
         replacement = start_tag if start_tag.rstrip().endswith("/>") else open_tag[:-1].rstrip() + "/>"
     new_text = text[:start] + replacement + text[end:]
-    return finish_write(args, new_text, f"RebuiltVariableMembers={args.name} datatype={datatype} members={generated}")
+    carried = sum(1 for member_name in preserve if f'NAME="{member_name}"' in replacement)
+    return finish_write(
+        args,
+        new_text,
+        f"RebuiltVariableMembers={args.name} datatype={datatype} members={generated} keptDesc={carried}",
+    )
 
 
 def cmd_remove_entity(args: argparse.Namespace) -> int:
@@ -3444,7 +3643,7 @@ def cmd_remove_entity(args: argparse.Namespace) -> int:
 # The bit widths come from the official help topic "系统数据类型" (BOOL 1,
 # BYTE/SINT/USINT 8, WORD/INT/UINT 16, DWORD/DINT/UDINT/REAL/TIME 32).
 #
-# Two things that table does not say, both *verified 2026-08-21* against the
+# Two things that table does not say, both *verified* against the
 # offsets the editor displays for real structs:
 #
 #   1. A BOOL takes a whole byte, not a bit. In a struct laid out REAL x5,
@@ -3624,6 +3823,425 @@ def cmd_validate_datatypes(args: argparse.Namespace) -> int:
     output_rows(shown,["entity", "name", "datatype", "status", "detail"], args.format, args.output, args.output_encoding)
     print(f"Checked={len(rows)} Problems={problems}")
     return 1 if (problems and args.strict) else 0
+
+
+DESC_MAX_CHARS = 128
+
+
+def cmd_validate_desc_length(args: argparse.Namespace) -> int:
+    """xRobotDesigner refuses a DESC longer than its limit; the XML does not.
+
+    The editor validates every description field it saves and rejects an
+    over-long one with 描述长度超过%d个字符的限制！ (the limit arrives as a
+    runtime %d; 128 observed on a VARIABLE description in 5.1.0).
+    Writing the same string straight into the XML bypasses the check
+    completely: the project loads, compiles and downloads, and the only
+    symptom is that the next person who opens that field in the GUI can no
+    longer save it -- not even after editing something else in the dialog.
+    A description written by a tool is therefore the only way this state
+    arises, which makes it worth checking after every scripted DESC change.
+
+    Whether the limit counts characters or encoded bytes is NOT verified.
+    The resource strings say 个字符 and are stored UTF-16, which points at
+    characters, but a GBK project turns every CJK character into two bytes,
+    so a 100-character Chinese description is 180 bytes on disk.  Rows over
+    the limit in bytes but under it in characters are reported as
+    OVER_BYTES, a warning rather than a problem; settle it by opening one
+    such field in the GUI and pressing OK.
+    """
+    root = parse_xml(read_text(args.project, args.encoding))
+    limit = args.max_chars
+    rows: list[dict[str, object]] = []
+    problems = 0
+    for element in root.iter():
+        desc = element.get("DESC")
+        if desc is None:
+            continue
+        chars = len(desc)
+        octets = len(desc.encode(args.encoding, "replace"))
+        if chars > limit:
+            status = "TOO_LONG"
+            problems += 1
+        elif octets > limit:
+            status = "OVER_BYTES"
+        else:
+            status = "OK"
+        if status == "OK" and not args.show_all:
+            continue
+        rows.append(
+            {
+                "tag": element.tag,
+                "name": element.get("NAME", ""),
+                "chars": chars,
+                "bytes": octets,
+                "status": status,
+                "desc": desc if args.show_all else desc[:60],
+            }
+        )
+    warnings = len([row for row in rows if row["status"] == "OVER_BYTES"])
+    output_rows(rows, ["tag", "name", "chars", "bytes", "status", "desc"], args.format, args.output, args.output_encoding)
+    print(f"Limit={limit} Problems={problems} OverBytes={warnings}")
+    return 1 if (problems and args.strict) else 0
+
+
+def blank_st_comments(text: str) -> str:
+    """Replace comment bodies with spaces, keeping every line number intact."""
+    out = list(text)
+    for match in ST_COMMENT_RE.finditer(text):
+        for pos in range(match.start(), match.end()):
+            if out[pos] != "\n":
+                out[pos] = " "
+    return "".join(out)
+
+
+def st_symbol_types(root: ET.Element) -> dict[str, str]:
+    """Map every name ST can write -- global, and struct member as ``A.B`` -- to its base type."""
+    structs = collect_struct_defs(root)
+    types: dict[str, str] = {}
+    for var in root.iter("VARIABLE"):
+        name = attr(var, "NAME")
+        if not name:
+            continue
+        try:
+            base, _, _ = parse_datatype(attr(var, "DATATYPE"))
+        except ValueError:
+            continue
+        types[name] = base
+        for member in structs.get(base, []):
+            try:
+                member_base, _, _ = parse_datatype(member["datatype"])
+            except ValueError:
+                continue
+            types[name + "." + member["name"]] = member_base
+    return types
+
+
+def pou_local_types(pou: ET.Element) -> dict[str, str]:
+    local: dict[str, str] = {}
+    for section in ("SECTION_VAR_INPUT", "SECTION_VAR_OUTPUT", "SECTION_VAR_INTERNAL"):
+        for var in pou.findall("./" + section):
+            name = attr(var, "NAME")
+            if not name:
+                continue
+            try:
+                base, _, _ = parse_datatype(attr(var, "DATATYPE"))
+            except ValueError:
+                continue
+            local[name] = base
+    return local
+
+
+def classify_subscript(expression: str, types: dict[str, str]) -> tuple[str, str, str]:
+    """Return (leading name, its type, status) for one ``[...]`` expression."""
+    text = expression.strip()
+    if re.fullmatch(r"\d+", text):
+        return text, "LITERAL", "OK"
+    match = ST_LEADING_NAME_RE.match(text)
+    if not match:
+        return text, "", "UNRESOLVED"
+    name = match.group(1)
+    datatype = types.get(name, "")
+    if not datatype:
+        return name, "", "UNRESOLVED"
+    if datatype in BITSTRING_DATATYPES:
+        return name, datatype, "BIT_STRING"
+    if datatype in FLOAT_DATATYPES:
+        return name, datatype, "NOT_INTEGER"
+    if datatype in INTEGER_DATATYPES:
+        return name, datatype, "OK"
+    return name, datatype, "UNRESOLVED"
+
+
+def cmd_validate_array_index(args: argparse.Namespace) -> int:
+    """An array subscript must be an integer; a bit string is refused.
+
+    BOOL, BYTE, WORD, DWORD and LWORD are bit strings in IEC 61131-3, not
+    numbers.  Subscripting with one is refused at compile time with
+    文本"["错误，数组的索引值不是整数 plus a follow-on 匹配变量表达式失败 on the
+    same statement.  It is an easy mistake to make because BYTE is the natural
+    type for a small counter such as a ring buffer write pointer, and because
+    a BYTE compares against an integer without complaint -- only subscripting
+    is refused.
+
+    The fix is the one the elementary types force: copy the value into a plain
+    integer variable and subscript with that.
+
+    *Verified on 5.1.0: a BYTE struct member used as a subscript
+    produced both errors; the same code with an INT scalar compiled.  Whether a
+    struct member of integer type is also refused was NOT tested -- the
+    projects at hand avoid it by convention, so no sample exists either way.*
+    """
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    globals_ = st_symbol_types(root)
+    rows: list[dict[str, object]] = []
+    problems = 0
+    for kind, tag in POU_TAGS.items():
+        by_name = {attr(pou, "NAME"): pou for pou in root.findall(".//" + tag)}
+        for span in iter_named_spans(text, tag):
+            # Line numbers have to come from the raw attribute.  A literal line
+            # break inside an XML attribute value is normalized to a space by
+            # any conforming parser, so the ElementTree view of CONTENT can be
+            # one single line and every finding would report line 1.
+            try:
+                _, _, raw_content = find_section_logic_raw(span.raw)
+            except ValueError:
+                continue
+            if not raw_content:
+                continue
+            content = normalize_newlines(decode_xml_attr_fragment(raw_content))
+            types = dict(globals_)
+            pou = by_name.get(span.name)
+            if pou is not None:
+                types.update(pou_local_types(pou))
+            code = blank_st_comments(content)
+            for number, line in enumerate(code.split("\n"), 1):
+                for match in ST_SUBSCRIPT_RE.finditer(line):
+                    name, datatype, status = classify_subscript(match.group(1), types)
+                    if status in ("BIT_STRING", "NOT_INTEGER"):
+                        problems += 1
+                    elif not args.show_all:
+                        continue
+                    rows.append(
+                        {
+                            "pou_type": kind,
+                            "pou": span.name,
+                            "line": number,
+                            "subscript": match.group(1).strip()[:40],
+                            "name": name,
+                            "datatype": datatype,
+                            "status": status,
+                        }
+                    )
+    output_rows(rows, ["pou_type", "pou", "line", "subscript", "name", "datatype", "status"],
+                args.format, args.output, args.output_encoding)
+    if problems:
+        print(f"ARRAY_INDEX=FAIL Problems={problems}")
+        return 1
+    print("ARRAY_INDEX=OK")
+    return 0
+
+
+# Modbus address spaces, and how wide one address is in each.  Coils and
+# discrete inputs are addressed bit by bit (function codes 01/02/05/15 carry
+# bits); input and holding registers are addressed 16 bits at a time (03/04/06/16
+# carry registers).  A mapping window inherits the unit from its START_ADDR.
+MODBUS_SPACES = [
+    (1, 9999, 1, "coils"),
+    (10001, 19999, 1, "discrete inputs"),
+    (30001, 39999, 16, "input registers"),
+    (40001, 49999, 16, "holding registers"),
+]
+
+# Width in bits of each elementary type, for working out how many addresses one
+# mapped tag consumes.
+DATATYPE_BITS = {
+    "BOOL": 1,
+    "BYTE": 8, "SINT": 8, "USINT": 8,
+    "INT": 16, "UINT": 16, "WORD": 16,
+    "DINT": 32, "UDINT": 32, "DWORD": 32, "REAL": 32,
+    "LINT": 64, "ULINT": 64, "LWORD": 64, "LREAL": 64,
+}
+
+
+def modbus_space_of(start_addr: int) -> tuple[int, str] | None:
+    for low, high, unit, label in MODBUS_SPACES:
+        if low <= start_addr <= high:
+            return unit, label
+    return None
+
+
+ST_ASSIGNMENT_RE = re.compile(r"\w\s*:=")
+
+
+def cmd_validate_comment_balance(args: argparse.Namespace) -> int:
+    """Check no ST comment runs past its intended end and swallows code.
+
+    ``(* ... *)`` spans lines and does not nest, so a single missing ``*)``
+    silently extends the comment to the next ``*)`` anywhere below -- typically
+    the end-of-line comment on the following statement, which takes that whole
+    statement with it.  The variable then keeps its default value.
+
+    Nothing catches this.  It is not a syntax error, the file still compiles and
+    downloads, the comment aligner is line-by-line and never sees it, and the
+    only symptom is one assignment that never happened.  Observed on 5.1.0
+: an unclosed line in a config block ate ``CFG.MotOpMode := 3;``,
+    which left a config-validity flag off, which in turn held the whole vehicle
+    state machine in its init state and disabled the chassis block through its
+    EN pin.  Three programs away from the typo, and every static check passed.
+
+    Two findings are reported.  UNCLOSED is a comment still open at the end of a
+    POU.  SWALLOWED_CODE is the one that actually catches the damage: an
+    assignment sitting on a line that is inside a comment which began on an
+    earlier line.  A deliberate multi-line comment holds prose, not ``:=``.
+    """
+    text = read_text(args.project, args.encoding)
+    rows: list[dict[str, object]] = []
+    problems = 0
+    for kind, tag in POU_TAGS.items():
+        for span in iter_named_spans(text, tag):
+            try:
+                _, _, raw_content = find_section_logic_raw(span.raw)
+            except ValueError:
+                continue
+            if not raw_content:
+                continue
+            content = normalize_newlines(decode_xml_attr_fragment(raw_content))
+            depth = 0
+            opened_at = 0
+            for number, line in enumerate(content.split(chr(10)), 1):
+                index = 0
+                while index < len(line):
+                    if line.startswith("(*", index):
+                        if depth == 0:
+                            opened_at = number
+                        depth += 1
+                        index += 2
+                    elif line.startswith("*)", index):
+                        depth = max(0, depth - 1)
+                        index += 2
+                    else:
+                        index += 1
+                if depth > 0 and number > opened_at and ST_ASSIGNMENT_RE.search(line):
+                    problems += 1
+                    rows.append({
+                        "pou_type": kind, "pou": span.name, "line": number,
+                        "status": "SWALLOWED_CODE",
+                        "detail": f"assignment inside a comment opened on line {opened_at}: "
+                                  + line.strip()[:60],
+                    })
+            if depth != 0:
+                problems += 1
+                rows.append({
+                    "pou_type": kind, "pou": span.name, "line": opened_at,
+                    "status": "UNCLOSED",
+                    "detail": f"comment opened here is still open at the end of the POU",
+                })
+    output_rows(rows, ["pou_type", "pou", "line", "status", "detail"],
+                args.format, args.output, args.output_encoding)
+    if problems:
+        print(f"COMMENT_BALANCE=FAIL Problems={problems}")
+        return 1
+    print("COMMENT_BALANCE=OK")
+    return 0
+
+
+def cmd_validate_modbus_mapping(args: argparse.Namespace) -> int:
+    """Check every Modbus mapping window addresses each tag exactly once.
+
+    Three ways to get this wrong, none of which shows up in the file:
+
+    A tag consumes as many addresses as its type is wide in that space's unit.
+    In a bit space a BYTE eats eight addresses, so one non-BOOL tag silently
+    shifts every OFFSET after it and the compiler rejects the project with
+    位号地址存在重叠 -- naming the window, not the tag that caused it.  In a
+    register space a 32-bit value needs two registers, and whether the next
+    OFFSET is then meant to step by one or by two is undocumented; this check
+    refuses wide types outright rather than guess.  A register mapping also
+    refuses anything narrower than one register -- compile error 0x22D,
+    变量长度小于 2 字节或不是偶数字节，无法关联寄存器地址 -- so BOOL, BYTE and
+    SINT need an INT copy made in the program.
+
+    A window can also be referenced but absent.  The port carries only
+    HARDWARE_MODBUS_MAPPING_QUOTE NAME=..., and the window itself lives under
+    TAGCONFIG; delete or clobber the window and the quote still parses.  The
+    project stays well-formed XML and every tool reports success.
+
+    *Verified on 5.1.0: a BYTE mapped into a discrete-input window
+    was rejected at compile time with 位号地址存在重叠.  That a BYTE occupies
+    exactly one address in a register space follows from Modbus itself -- a
+    register is the smallest addressable unit there -- but was NOT tested
+    separately.*
+    """
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    types = st_symbol_types(root)
+    rows: list[dict[str, object]] = []
+    problems = 0
+
+    def add(window: str, offset: object, tag: str, datatype: str, status: str, detail: str) -> None:
+        nonlocal problems
+        if status != "OK":
+            problems += 1
+        elif not args.show_all:
+            return
+        rows.append({"window": window, "offset": offset, "tag": tag,
+                     "datatype": datatype, "status": status, "detail": detail})
+
+    windows = {}
+    for mapping in root.iter("HARDWARE_MODBUS_MAPPING"):
+        windows[attr(mapping, "NAME")] = mapping
+
+    # A quote on a port that names no window: the mapping is silently dead.
+    quoted = set()
+    for quote in root.iter("HARDWARE_MODBUS_MAPPING_QUOTE"):
+        name = attr(quote, "NAME")
+        quoted.add(name)
+        if name not in windows:
+            add(name, "", "", "", "WINDOW_MISSING",
+                "a port quotes this window but no HARDWARE_MODBUS_MAPPING defines it")
+    for name in windows:
+        if name not in quoted:
+            add(name, "", "", "", "WINDOW_UNUSED", "defined but no port quotes it")
+
+    for name, mapping in windows.items():
+        try:
+            start = int(attr(mapping, "START_ADDR"))
+            end = int(attr(mapping, "END_ADDR"))
+        except ValueError:
+            add(name, "", "", "", "BAD_RANGE", "START_ADDR/END_ADDR is not an integer")
+            continue
+        space = modbus_space_of(start)
+        if space is None:
+            add(name, "", "", "", "BAD_RANGE",
+                f"START_ADDR {start} falls in no Modbus address space")
+            continue
+        unit, label = space
+        cursor = 0
+        for child in mapping.findall("./HARDWARE_MODBUS_TAG_MAPPING"):
+            tag = attr(child, "TAG_NAME")
+            try:
+                offset = int(attr(child, "OFFSET"))
+            except ValueError:
+                add(name, attr(child, "OFFSET"), tag, "", "BAD_OFFSET", "OFFSET is not an integer")
+                continue
+            base = types.get(ARRAY_SUBSCRIPT_RE.sub("", tag), "")
+            if not base:
+                add(name, offset, tag, "", "UNKNOWN_TAG", "no variable or struct member of this name")
+                continue
+            bits = DATATYPE_BITS.get(base)
+            if bits is None:
+                add(name, offset, tag, base, "UNKNOWN_TYPE", "width of this type is unknown")
+                continue
+            if bits > unit:
+                add(name, offset, tag, base, "TOO_WIDE",
+                    f"{bits} bits in a {unit}-bit-per-address space ({label}); "
+                    "scale it to a 16-bit integer in the program and map that")
+                cursor = offset + (bits + unit - 1) // unit
+                continue
+            if unit == 16 and bits < 16:
+                add(name, offset, tag, base, "TOO_NARROW",
+                    "one byte; a register mapping needs an even byte count of at "
+                    "least two (compile error 0x22D) -- copy it into an INT and map that")
+                cursor = offset + 1
+                continue
+            if offset != cursor:
+                add(name, offset, tag, base, "OFFSET_CLASH",
+                    f"expected OFFSET {cursor}; the tags before it occupy that many addresses")
+            else:
+                add(name, offset, tag, base, "OK", "")
+            cursor = offset + max(1, (bits + unit - 1) // unit)
+        if cursor > end - start + 1:
+            add(name, "", "", "", "WINDOW_TOO_SMALL",
+                f"tags need {cursor} addresses but the window spans {end - start + 1}")
+
+    output_rows(rows, ["window", "offset", "tag", "datatype", "status", "detail"],
+                args.format, args.output, args.output_encoding)
+    if problems:
+        print(f"MODBUS_MAPPING=FAIL Problems={problems}")
+        return 1
+    print(f"MODBUS_MAPPING=OK Windows={len(windows)}")
+    return 0
 
 
 def cmd_export_graphic(args: argparse.Namespace) -> int:
@@ -4488,7 +5106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("set-attrs", help="set attributes on selected structured project entities without hand-editing XML")
     add_common_project_arg(p)
-    p.add_argument("--kind", required=True, choices=["variable", "hardware-tag", "user-struct", "user-struct-member", "pou", "pou-var", "task", "trig-condition", "block", "downlink-port", "station", "slave-object", "slave-mapping", "cmd-group"])
+    p.add_argument("--kind", required=True, choices=["variable", "hardware-tag", "user-struct", "user-struct-member", "pou", "pou-var", "task", "trig-condition", "block", "downlink-port", "station", "com-cmd", "slave-object", "slave-mapping", "cmd-group"])
     p.add_argument("--name", help="entity name, or POU name for kind=pou/pou-var")
     p.add_argument("--pou-type", choices=sorted(POU_TAGS), help="required for kind=pou or kind=pou-var")
     p.add_argument("--var-section", choices=["input", "output", "internal"], help="required for kind=pou-var")
@@ -4499,6 +5117,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task-id", help="task ID for kind=task or kind=trig-condition")
     p.add_argument("--task-kind", choices=sorted(TASK_TAGS), help="task kind for kind=task or kind=trig-condition")
     p.add_argument("--port-id", help="downlink port ID for kind=downlink-port")
+    p.add_argument("--cmd-id", help="HARDWARE_COM_CMD ID for kind=com-cmd")
     p.add_argument("--address", help="station address for kind=station")
     p.add_argument("--index", help="CANopen slave object index in decimal for kind=slave-object/slave-mapping")
     p.add_argument("--offset", help="mapping offset for kind=slave-mapping")
@@ -4567,6 +5186,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_output_args(p)
     p.add_argument("--show-all", action="store_true", help="print all enabled bindings when validation passes")
     p.set_defaults(func=cmd_validate_hardware_bindings)
+
+    p = sub.add_parser("validate-slave-objects", help="check CANopen slave object names, datatypes and the per-port mapping budget")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--port-id")
+    p.add_argument("--show-all", action="store_true", help="print all slave objects when validation passes")
+    p.set_defaults(func=cmd_validate_slave_objects)
 
     p = sub.add_parser("validate-command-directions", help="check enabled CANopen output commands are actually written by a program, and inputs are not")
     add_common_project_arg(p)
@@ -4673,6 +5299,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-unknown-datatype", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-backup", action="store_true")
+    p.add_argument("--drop-element-desc", action="store_true",
+                   help="do not carry existing per-element DESC across the rebuild")
     p.set_defaults(func=cmd_rebuild_variable_members)
 
     p = sub.add_parser("remove", help="delete a VARIABLE or USER_STRUCT")
@@ -4696,6 +5324,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true", help="exit non-zero when problems are found")
     p.add_argument("--show-all", action="store_true", help="print every checked row, not only problems")
     p.set_defaults(func=cmd_validate_datatypes)
+
+    p = sub.add_parser("validate-desc-length", help="check every DESC fits the GUI description length limit")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--max-chars", type=int, default=DESC_MAX_CHARS, help="GUI limit; 128 observed on 5.1.0")
+    p.add_argument("--strict", action="store_true", help="exit non-zero when problems are found")
+    p.add_argument("--show-all", action="store_true", help="print every DESC, not only the over-long ones")
+    p.set_defaults(func=cmd_validate_desc_length)
+
+    p = sub.add_parser("validate-array-index", help="check every ST array subscript is an integer, not a bit string")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--show-all", action="store_true", help="print every subscript, not only the refused ones")
+    p.set_defaults(func=cmd_validate_array_index)
+
+    p = sub.add_parser("validate-comment-balance", help="check no ST comment swallows the code after it")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.set_defaults(func=cmd_validate_comment_balance)
+
+    p = sub.add_parser("validate-modbus-mapping", help="check Modbus mapping windows address each tag exactly once")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--show-all", action="store_true", help="print every mapped tag, not only the problems")
+    p.set_defaults(func=cmd_validate_modbus_mapping)
 
     p = sub.add_parser("list-tasks", help="list control scheme tasks with period, trigger and program order")
     add_common_project_arg(p)

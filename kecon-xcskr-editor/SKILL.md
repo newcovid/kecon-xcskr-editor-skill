@@ -184,6 +184,16 @@ unsupported. Point it at the installation with `--install-dir` or
 `HARDWARE_DEVICE_UPLINK_PORT@ADDRESS` and `HARDWARE_CAN_DEVICE_SLAVE@NODE_ID`.
 `set-attrs --kind station` refuses an `ADDRESS` update for that reason.
 
+`set-attrs --kind station` only reaches the `HARDWARE_DEVICE_UPLINK_PORT` start
+tag. The per-slave CANopen settings a station page shows in the GUI --
+`TIMEOUT` (通信检测超时时间) and `COMM_CHECK_WAY` (通信检测机制) -- live on the
+nested `HARDWARE_CAN_DEVICE_SLAVE`, and the command **prints success while
+writing the attribute onto the wrong element** (verified: eight
+`TIMEOUT=3000` writes reported `SetAttrs=station:5:N`, added a meaningless
+`TIMEOUT` to eight uplink ports, and left every slave at its old value). Read
+the slave tags back after any station write; patch those attributes directly
+until a dedicated selector exists.
+
 Static checks:
 
 ```powershell
@@ -194,6 +204,8 @@ python ... validate-canopen-command-ids --project P    # duplicates AND enabled-
 python ... validate-hardware-bindings --project P
 python ... validate-command-directions --project P
 python ... validate-fb-calls --project P
+python ... validate-desc-length --project P --strict   # only a tool can write an over-long DESC
+python ... validate-array-index --project P            # a bit string cannot subscript an array
 python ... rebuild-user-struct-members --project P
 python ... struct-layout --project P --struct S
 ```
@@ -312,6 +324,27 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
 ## Guardrails
 
 - Do not full-document reserialize `.xcskr` with ElementTree. It can flatten ST formatting.
+- A variable bound into the object dictionary is read asynchronously by the
+  master and must be assigned **once per scan**. Building a status word with
+  `X := 0` then a series of `X := X + n` publishes every partial sum; the master
+  sees `0`, `1`, `3` against a nominal `0x83`, with nothing logged anywhere.
+  Pack into a scratch variable and write the result once.
+- Re-importing an EDS rebuilds a node's command groups: `EDTYPE` is reset to
+  output and tags are renamed after the EDS object names. An input command left
+  as output makes the master overwrite the slave's data with zeros every cycle,
+  silently. After any EDS import run `validate-command-directions` and re-grep
+  the ST for that node's tag prefix.
+- Port settings (`CAN_BAUD`, `CAN_TERMINAL_R`, serial framing, `TCP_LOCAL_PORT`)
+  live in `HARDWARE_PROPERTY` children, not on the port's start tag. `set-attrs
+  --kind downlink-port` routes them there and prints
+  `downlink-port:<id>:<property>`; a bare `downlink-port:<id>` means the value
+  went onto the tag and changed nothing.
+- A CANopen slave object dictionary edited outside the GUI can be silently
+  rejected by the runtime: names must be =<15 ASCII alphanumerics, `DATATYPE`
+  must match the GUI dropdown (`boolean`, not `bool`), and a port carries at
+  most 63 bound variables. Nothing warns; the controller simply builds no
+  dictionary. Run `validate-slave-objects` after every such edit.
+- Verify a `set-attrs` write by reading the target attribute back. The command reports the selector it resolved, not the attribute it changed, so a selector that lands on an ancestor element succeeds loudly and changes nothing that matters (see the station note above).
 - Do not infer physical CAN ports from XML `NAME` alone; compare `ID`, `DISPLAY`, `PHYSICAL_ID`, and exported hardware context.
 - Do not disable hardware tags, command groups, or mappings merely to silence a static warning.
 - Do not write to the `CONNECTION_PIN` attribute; it is empty in every observed project and carries no binding.
@@ -321,8 +354,26 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
 - A command on `MODE="1"` fires on value change, so a program that writes a command signature must clear the buffer afterwards or the same command never repeats. A command on `MODE="0"` is resent every cycle, which for an EEPROM-backed object such as `1010:01` is device wear rather than a one-shot.
 - Keep an ST function block call's argument list in declaration order. Named arguments do not make order optional (verified): `add-pou-var` appends, so a call that lists new pins in the middle raises one `FBDError` id=769 per call site, with no line number and FBD wording about updating the block instance.
 - Run `validate-controller-support` before handing a project back for compilation: the chassis driver type, the CANopen command budget and the task limits are vendor-table constraints that no amount of XML tidiness will satisfy.
-- Enabling a CANopen object takes **three** writes, not two: the channel tag's `ENABLE`, the group's `HARDWARE_GROUP_ENABLE`, and a **command id** on `HARDWARE_CAN_CMD@ID`. The GUI hands out the id when you tick the group; `set-attrs --kind cmd-group` does not, so always follow it with `alloc-canopen-command-ids`. Skipping the id costs a build with no clue in it: the compiler blames every program that uses the tag with `文本"<tag>"错误，字符串无法识别` on 第1行, and nothing mentions the command group (verified 2026-08-25: 27 such groups -> 216 errors). Only uniqueness is required; see references/xcskr-structure.md for the numbering the GUI itself uses.
+- Exported `.st` files are CRLF, always. The GUI stores each POU's line breaks in its own style (literal LF / `&#10;` / `&#x0D;&#x0A;`, current versions write the third), so exporting verbatim gives a mixture and every GUI edit flips one more file into a whole-file diff (verified: a 3-line comment change arrived as 1599 changed lines). `export-workspace` normalizes; `import-workspace` still writes each element back in its own style, so the project file never churns. Point the editor's `files.eol` at CRLF for `.st` so hand edits do not flip it back.
+- One scratch variable, one task. Task priority is startup > event > cycle > main and a higher task **preempts** a lower one mid-scan, so a scratch shared across tasks voids the write-once fix it was added for -- and does worse: preemption between `X := 0` and `target := X` latches the other task's value into the target until the next scan, where a torn read would have self-corrected (verified). Shared `FOR` counters are the same trap: the lower-priority loop exits early and leaves an initialisation array half-filled with the done-flag still set. Nothing in the file marks a variable task-local and the compiler stays silent.
+- Subscript arrays with an integer only. `BOOL`, `BYTE`, `WORD`, `DWORD` and `LWORD` are bit strings in IEC 61131-3, not numbers, and the compiler refuses one as a subscript with `文本"["错误，数组的索引值不是整数` plus a follow-on `匹配变量表达式失败` on the same statement. `BYTE` is the tempting type for a small counter such as a ring buffer write pointer, and nothing else complains -- a `BYTE` compares against an integer happily -- so only subscripting exposes it. Copy the value into a plain integer variable and subscript with that. `validate-array-index` reports it; `check-workspace` runs it. *Verified on 5.1.0.*
+- Set a Modbus RTU master command's poll period, function code, first register or register count with `set-attrs --kind com-cmd --cmd-id <ID> --attr COM_CMD_START_ADDR=<n>`, one property per call. Like a port's baud rate, these live in `HARDWARE_PROPERTY` children; written onto the `HARDWARE_COM_CMD` start tag they are accepted everywhere and the command keeps polling its old register. Remember the first register is one-based -- see `references/xcskr-structure.md`.
+- Fill in per-element descriptions. An array member nests one `VARIABLE_MEMBER` per element, each with its own `DESC`, and that is what the variable monitor shows beside `Name[57]`; without it an engineer has to go back to a lookup table mid-commissioning. Fill them by rewriting one element's `DESC` attribute in place -- never by round-tripping the document through ElementTree, which reformats the whole file. `rebuild-variable-members` preserves them (reporting `keptDesc=N`), so the order of that work no longer matters. *Verified on 5.1.0.*
+- Keep every `DESC` inside the GUI's description length limit (`描述长度超过%d个字符的限制！`; **128** observed on 5.1.0). The XML accepts any length, so an over-long description written by a tool loads, compiles and runs -- and then silently blocks whoever next opens that field in the GUI from saving the dialog at all. `validate-desc-length` reports it; `check-workspace` runs it. Whether the limit counts characters or GBK bytes is unverified, so stay inside it both ways: a Chinese description costs two bytes per character.
+- Enabling a CANopen object takes **three** writes, not two: the channel tag's `ENABLE`, the group's `HARDWARE_GROUP_ENABLE`, and a **command id** on `HARDWARE_CAN_CMD@ID`. The GUI hands out the id when you tick the group; `set-attrs --kind cmd-group` does not, so always follow it with `alloc-canopen-command-ids`. Skipping the id costs a build with no clue in it: the compiler blames every program that uses the tag with `文本"<tag>"错误，字符串无法识别` on 第1行, and nothing mentions the command group (verified: 27 such groups -> 216 errors). Only uniqueness is required; see references/xcskr-structure.md for the numbering the GUI itself uses.
 - Use xRobotDesigner GUI compile/download as the final authority. Static XML checks only prove that the edited file is structurally sane enough to hand back for GUI validation.
 - Close xRobotDesigner before writing to a project from here. The GUI holds its own in-memory copy and a single save overwrites the whole file, so a CLI edit made while the project is open is lost without any error. An ordinary text editor such as VSCode holds no exclusive lock and does not need to be closed.
-- Preserve the self-closing style an element already uses (verified 2026-08-21). V5.1.1.9998-C writes `"/>` and the V5.0 sample projects write `" />`; both parse identically, but rewriting one as the other puts a spurious line in every diff and stops an unchanged round trip from being byte-identical. `replace_section_logic_raw` now keeps whichever the element had.
+- A Modbus RTU slave has no `CommFailed` tag -- only CANopen slaves get one. Judge an RTU link from its payload (a field that cannot legitimately be zero, plus whether the block changes at all within a timeout), and do not assume the runtime zeroes a stale channel tag; that behaviour is unverified.
+- The debug watch list is **not** stored in the `.xcskr` (verified:
+  no monitor / watch / force / trace element or attribute in two production
+  projects or in either official sample; the byte string `DebugVar` appears zero
+  times). It is a sidecar, `<project dir>/DebugVar_CS<n>_P<group>.txt`, one line
+  of `variable,0,colour` per watched variable, named by the vendor's own
+  `DebugVar_CS%d_P%d.txt` in `RobotBaseCommonAcsR.dll`. So watching a variable
+  cannot invalidate a hash taken over the project, and the sidecar directory can
+  be git-ignored wholesale. What **does** invalidate such a hash is any GUI
+  save, logic change or not: `PROJECT@VERSION` is a save counter that only the
+  GUI writes. After the GUI has had a project, re-export the workspace rather
+  than looking for what moved.
+- Preserve the self-closing style an element already uses (verified). V5.1.1.9998-C writes `"/>` and the V5.0 sample projects write `" />`; both parse identically, but rewriting one as the other puts a spurious line in every diff and stops an unchanged round trip from being byte-identical. `replace_section_logic_raw` now keeps whichever the element had.
 - Do not expect a bare `>` inside `SECTION_LOGIC_ST CONTENT`. Counted across the IVC300 project, its IVC200 sibling and the official GUI-authored sample: 845 occurrences of `&gt;` and zero bare `>`. Writing a bare `>` parses, but it is not what the GUI produces.

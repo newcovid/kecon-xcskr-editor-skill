@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+*.bak
 *.bak_*
 .venv/
 help-cache/
@@ -7,3 +9,6 @@ help-cache/
 
 # 本机资源路径（每台机器不同，且常含个人目录），只提交 .example.json
 kecon-resources.json
+
+# 真工程不进这个仓库，见 PUBLISHING.md
+*.xcskr

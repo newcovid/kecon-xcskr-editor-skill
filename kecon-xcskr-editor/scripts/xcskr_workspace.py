@@ -106,9 +106,33 @@ def read_workspace_file(path: Path) -> str:
     return path.read_text(encoding=WORKSPACE_ENCODING, newline="")
 
 
+ST_NEWLINE = "\r\n"
+
+
 def write_workspace_file(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding=WORKSPACE_ENCODING, newline="")
+
+
+def write_workspace_st(path: Path, text: str) -> None:
+    """Write an exported .st with one fixed line ending, CRLF.
+
+    ST bodies live inside a `SECTION_LOGIC_ST CONTENT` attribute, and the GUI
+    writes that attribute's line breaks three different ways depending on which
+    version last touched the POU -- literal LF, `&#10;`, or `&#x0D;&#x0A;`.
+    Exporting the decoded text verbatim therefore hands out a mix: a POU the
+    GUI has edited comes out CRLF, its neighbours come out LF.  Every later
+    GUI edit flips one more file and shows up as a whole-file diff that buries
+    the real change.
+
+    The GUI's own style is `&#x0D;&#x0A;`, and we cannot change the GUI, so the
+    workspace converges on CRLF instead of fighting it.  Nothing downstream
+    cares: `xml_attr_encode` normalizes newlines before re-encoding, so import
+    still writes back in each element's own style and the round trip is stable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", ST_NEWLINE)
+    path.write_text(body, encoding=WORKSPACE_ENCODING, newline="")
 
 
 def write_json_file(path: Path, data: object) -> None:
@@ -758,7 +782,7 @@ def export_workspace(project: Path, workspace: Path, encoding: str, force: bool)
             # raw_st_for_pou already unescapes the attribute; decoding twice
             # would turn a literal &amp;amp; in the source into a bare &.
             content = xt.raw_st_for_pou(text, xt.pou_tag(item["pou_type"]), item["pou"])
-            write_workspace_file(target, content)
+            write_workspace_st(target, content)
         else:
             record = graphic_by_key[(item["pou_type"], item["pou"])]
             write_json_file(target, graph_to_json(record))
@@ -788,7 +812,7 @@ def export_workspace(project: Path, workspace: Path, encoding: str, force: bool)
     write_workspace_file(readonly / "结构体.md", render_structs_md(structs))
     write_workspace_file(readonly / "任务.md", render_tasks_md(scheme["tasks"]))
     write_workspace_file(readonly / "硬件标签.tsv", render_hardware_tsv(xt.collect_hardware_tag_rows(root)))
-    write_workspace_file(readonly / "声明.st", render_declarations(variables, structs))
+    write_workspace_st(readonly / "声明.st", render_declarations(variables, structs))
     symbols = build_symbols(variables, structs)
     function_blocks = collect_function_block_interfaces(root)
     write_json_file(
@@ -1036,6 +1060,10 @@ PROJECT_VALIDATORS = [
     ("validate-hardware-bindings", []),
     ("validate-canopen-command-ids", []),
     ("validate-controller-support", []),
+    ("validate-desc-length", ["--strict"]),
+    ("validate-array-index", []),
+    ("validate-modbus-mapping", []),
+    ("validate-comment-balance", []),
 ]
 
 

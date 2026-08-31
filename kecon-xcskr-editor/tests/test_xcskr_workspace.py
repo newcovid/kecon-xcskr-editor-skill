@@ -106,6 +106,30 @@ class WorkspaceRoundTripTests(unittest.TestCase):
         content = self.program_file("程序/主任务/01_MainProgram.st").read_text(encoding="utf-8", newline="")
         self.assertEqual(content, "FB_SCALE(InValue:=1, Scale=>StatusWords[0]);")
 
+    def test_st_export_uses_crlf_whatever_the_project_stores(self) -> None:
+        """The GUI writes CRLF into POUs it edits; the workspace stays uniform.
+
+        Without this the exported files carry a mix -- a GUI-edited POU comes
+        out CRLF, its neighbours LF -- and every later GUI edit flips one more
+        file into a whole-file diff.
+        """
+        self.export()
+        crlf = b"\r\n"
+        lf = b"\n"
+        for path in sorted((self.workspace / "程序").rglob("*.st")):
+            raw = path.read_bytes()
+            self.assertNotIn(lf, raw.replace(crlf, b""), f"{path.name} has a bare LF")
+        declarations = (self.workspace / "只读" / "声明.st").read_bytes()
+        self.assertNotIn(lf, declarations.replace(crlf, b""))
+
+    def test_crlf_workspace_round_trips_without_touching_the_project(self) -> None:
+        """CRLF in, each element's own style back out: no drift."""
+        self.export()
+        before = sha(self.project)
+        result = self.do_import()
+        self.assertIn("NoChanges=1", result.stdout)
+        self.assertEqual(sha(self.project), before)
+
     # -- import ------------------------------------------------------------
 
     def test_import_without_changes_is_a_no_op(self) -> None:
@@ -178,7 +202,10 @@ class WorkspaceRoundTripTests(unittest.TestCase):
 
         self.export("--force")
         again = self.program_file("程序/主任务/01_MainProgram.st").read_text(encoding="utf-8", newline="")
-        self.assertEqual(again, source + "\n")
+        # 导出统一 CRLF，所以回来的是 CRLF 版本；内容本身必须一字不差。
+        norm = again.replace("\r\n", "\n")
+        self.assertEqual(norm, source.replace("\r\n", "\n") + "\n")
+        self.assertTrue(again.endswith("\r\n"))
 
     # -- graphical logic ---------------------------------------------------
 
