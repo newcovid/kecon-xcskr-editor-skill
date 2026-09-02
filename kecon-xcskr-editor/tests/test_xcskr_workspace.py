@@ -101,6 +101,16 @@ class WorkspaceRoundTripTests(unittest.TestCase):
         self.assertNotIn("StatusWords[0]", symbols)
         self.assertEqual(symbols["StatusWords[]"]["desc"], "status words")
 
+    def test_readonly_hardware_tsv_carries_the_tag_description(self) -> None:
+        # 硬件标签.tsv is what an audit reads instead of the project file, so a
+        # dropped description column reads as "this project has none".
+        self.export()
+        tsv = (self.workspace / "只读" / "硬件标签.tsv").read_text(encoding="utf-8")
+        header = tsv.splitlines()[0].split("	")
+        self.assertIn("desc", header)
+        row = next(line for line in tsv.splitlines() if line.startswith("Axis1_Position_6004	"))
+        self.assertEqual(row.split("	")[header.index("desc")], "axis position")
+
     def test_st_export_matches_extract_st(self) -> None:
         self.export()
         content = self.program_file("程序/主任务/01_MainProgram.st").read_text(encoding="utf-8", newline="")

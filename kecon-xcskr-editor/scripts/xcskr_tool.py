@@ -695,6 +695,7 @@ def collect_hardware_tag_rows(root: ET.Element, pattern: str | None = None) -> l
                 "name": name,
                 "datatype": tag.get("DATATYPE", ""),
                 "enable": tag.get("ENABLE", ""),
+                "desc": tag.get("DESC", ""),
                 "access": "" if group is None else group.get("CMD_ACCESS_TYPE", ""),
                 "index": "" if group is None else group.get("INDEX_ID", ""),
                 "sub": "" if group is None else group.get("SUB_INDEX_ID", ""),
@@ -960,7 +961,7 @@ def cmd_export_slave_mappings(args: argparse.Namespace) -> int:
 def cmd_list_hardware_tags(args: argparse.Namespace) -> int:
     root = parse_xml(read_text(args.project, args.encoding))
     rows = collect_hardware_tag_rows(root, args.pattern)
-    output_rows(rows, ["name", "datatype", "enable", "access", "index", "sub", "length", "device", "node"], args.format, args.output, args.output_encoding)
+    output_rows(rows, ["name", "datatype", "enable", "desc", "access", "index", "sub", "length", "device", "node"], args.format, args.output, args.output_encoding)
     return 0
 
 

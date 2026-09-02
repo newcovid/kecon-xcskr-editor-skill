@@ -1220,6 +1220,24 @@ class XcskrToolTests(unittest.TestCase):
 
             self.assertIn('"cmd_id": 2', result.stdout)
 
+    def test_list_hardware_tags_reports_the_tag_description(self) -> None:
+        # The description is the only place a channel's wiring meaning lives.
+        # It used to be dropped by every derived view, which is invisible: the
+        # view renders, the column is simply blank, and an audit run against the
+        # view concludes the project has no descriptions to fix.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("list-hardware-tags", "--project", str(project),
+                              "--pattern", "^Axis1_Position", "--format", "csv")
+
+            # csv writes CRLF and the console translates again, so blank lines
+            # sit between the rows.
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            header, row = lines[0], lines[1]
+            self.assertIn("desc", header.split(","))
+            self.assertIn("axis position", row)
+
     def test_rename_hardware_tag_moves_members_and_command_group_together(self) -> None:
         # ST addresses the members (`Tag[0]`), not the tag, and the command group
         # finds its tag by name.  A rename that moves only the start tag leaves a
