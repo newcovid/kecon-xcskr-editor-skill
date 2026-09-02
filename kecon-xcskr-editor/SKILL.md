@@ -121,7 +121,20 @@ python ... add-function-block --project P --name AlarmLatch --desc "报警锁存
     --input "Trigger:BOOL:报警条件" --input "Code:UINT:报警码" `
     --output "Active:BOOL:报警激活" --internal "prevReset:BOOL:上周期复位"
 python ... add-pou-var --project P --name AlarmLatch --var-section input --var "Reset:BOOL:复位请求"
+python ... rename-pou --project P --pou-type function-block --name AlarmLatch --new-name Latch
+python ... rename-pou --project P --pou-type program --name "旧程序名" --new-name "新程序名"
+python ... remove --project P --kind pou --pou-type function-block --name Latch
+python ... remove --project P --kind pou --pou-type program --name "旧程序名"
 ```
+
+`rename-pou` moves the declaration and, for a function block, every ST call site
+and graphical block `TYPE` with it, reporting how many of each it changed; a
+program has no call sites to follow. It refuses a name already taken by another
+POU, a variable or a hardware tag. `remove --kind pou` deletes the POU with its
+logic in one element, and refuses while a function block is still called --
+`--force` overrides but does not touch the calling code. Deleting the one
+program of an event task is allowed and warned about, since an event task holds
+exactly one.
 
 Programs execute in the document order of their task, so `--after` / `--before` /
 `--index` are functional, not cosmetic; `move-program` is how a safety stage gets
@@ -140,6 +153,7 @@ python ... add-variable --project P --name Wheel --datatype "Wheel_Data[8]" --de
 python ... add-variable --project P --name SafeStopReq --datatype BOOL --init-value OFF
 python ... rebuild-variable-members --project P --name Wheel
 python ... remove --project P --kind variable --name Wheel
+python ... remove --project P --kind user-struct-member --struct Wheel_Data --member Spare
 python ... validate-datatypes --project P --strict
 ```
 
@@ -147,6 +161,23 @@ python ... validate-datatypes --project P --strict
 whole `VARIABLE_MEMBER` tree for arrays and structs, and refuses names that collide with an
 existing variable or hardware tag. After changing a struct, every variable that uses it needs
 `rebuild-variable-members`; `validate-datatypes` finds the ones that drifted.
+
+`remove --kind user-struct-member` does both halves itself: it deletes the member
+from the type and rebuilds every variable built on that type -- directly, through
+an array, or nested inside another type -- so `validate-datatypes` stays clean and
+per-element descriptions survive. It refuses while ST, a graphical pin binding, a
+Modbus or CANopen mapping, or a command group still names the member, listing
+each place with a line number; `--force` overrides and leaves that code alone.
+
+CANopen slave object dictionary:
+
+```powershell
+python ... remove --project P --kind slave-object --port-id 8 --index 0x2001
+```
+
+The index may be hex or decimal -- the file stores decimal, the manual quotes
+hex. An object with variables mapped to it is refused until `--force`, which
+removes the mappings with it. Run `validate-slave-objects` afterwards.
 
 LD/FBD graphical logic:
 
@@ -318,6 +349,8 @@ name a line; the project-wide validators are reported as a pass/fail summary.
 - User variables live under `TAGCONFIG`, not under `GLOBAL_TAG_CONFIG`, which is normally an empty self-closing element.
 - Graphical bindings live in `CONTROL_BLOCK_CONNECTION`: `CONNECTION_TYPE="1"` is a variable operand, `CONNECTION_TYPE="2"` is a `CONTROL_LOGIC_LINE` name.
 - ST is stored in `SECTION_LOGIC_ST CONTENT`; raw line breaks can be literal LF or XML numeric references.
+- An XML parser turns a *literal* line break inside an attribute value into a space, so a POU stored with literal LF reads back through ElementTree as one line and a line number counted on it is always 1. Count on the raw attribute text instead; `st_raw_line_number` does.
+- A POU is self-contained: nothing outside its own element names a program, so deleting or renaming one touches one element. A function block is the opposite -- every ST call and every graphical block `TYPE` spells its name and has to move with it.
 
 Read `references/xcskr-structure.md` before changing hardware, task, variable, POU, graphical, or CAN/CANopen structures. Read `references/ld-fbd-st.md` when deciding between ST and a graphical language, or when explaining the difference.
 
@@ -338,7 +371,10 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
   live in `HARDWARE_PROPERTY` children, not on the port's start tag. `set-attrs
   --kind downlink-port` routes them there and prints
   `downlink-port:<id>:<property>`; a bare `downlink-port:<id>` means the value
-  went onto the tag and changed nothing.
+  went onto the tag and changed nothing. `ENABLE` is the exception: it really
+  is a start-tag attribute despite sitting on the same GUI page, so for it the
+  bare `downlink-port:<id>` is the correct report (verified by reading the tag
+  back).
 - A CANopen slave object dictionary edited outside the GUI can be silently
   rejected by the runtime: names must be =<15 ASCII alphanumerics, `DATATYPE`
   must match the GUI dropdown (`boolean`, not `bool`), and a port carries at
@@ -356,10 +392,12 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
 - Run `validate-controller-support` before handing a project back for compilation: the chassis driver type, the CANopen command budget and the task limits are vendor-table constraints that no amount of XML tidiness will satisfy.
 - Exported `.st` files are CRLF, always. The GUI stores each POU's line breaks in its own style (literal LF / `&#10;` / `&#x0D;&#x0A;`, current versions write the third), so exporting verbatim gives a mixture and every GUI edit flips one more file into a whole-file diff (verified: a 3-line comment change arrived as 1599 changed lines). `export-workspace` normalizes; `import-workspace` still writes each element back in its own style, so the project file never churns. Point the editor's `files.eol` at CRLF for `.st` so hand edits do not flip it back.
 - One scratch variable, one task. Task priority is startup > event > cycle > main and a higher task **preempts** a lower one mid-scan, so a scratch shared across tasks voids the write-once fix it was added for -- and does worse: preemption between `X := 0` and `target := X` latches the other task's value into the target until the next scan, where a torn read would have self-corrected (verified). Shared `FOR` counters are the same trap: the lower-priority loop exits early and leaves an initialisation array half-filled with the done-flag still set. Nothing in the file marks a variable task-local and the compiler stays silent.
-- Subscript arrays with an integer only. `BOOL`, `BYTE`, `WORD`, `DWORD` and `LWORD` are bit strings in IEC 61131-3, not numbers, and the compiler refuses one as a subscript with `文本"["错误，数组的索引值不是整数` plus a follow-on `匹配变量表达式失败` on the same statement. `BYTE` is the tempting type for a small counter such as a ring buffer write pointer, and nothing else complains -- a `BYTE` compares against an integer happily -- so only subscripting exposes it. Copy the value into a plain integer variable and subscript with that. `validate-array-index` reports it; `check-workspace` runs it. *Verified on 5.1.0.*
+- Subscript arrays with an integer only. `BOOL`, `BYTE`, `WORD`, `DWORD` and `LWORD` are bit strings in IEC 61131-3, not numbers, and the compiler refuses one as a subscript with `文本"["错误，数组的索引值不是整数` plus a follow-on `匹配变量表达式失败` on the same statement. `BYTE` is the tempting type for a small counter such as a ring buffer write pointer, and nothing else complains -- a `BYTE` compares against an integer happily -- so only subscripting exposes it. Copy the value into a plain integer variable and subscript with that. An integer-typed member of a user structure is fine as a subscript directly (`Table[Status.Index]` with an `INT` member compiles; verified on 5.1.0), so the copy is only needed for bit-string types -- an array element used as a subscript remains unverified. `validate-array-index` reports the bit-string case; `check-workspace` runs it. *Verified on 5.1.0.*
 - Set a Modbus RTU master command's poll period, function code, first register or register count with `set-attrs --kind com-cmd --cmd-id <ID> --attr COM_CMD_START_ADDR=<n>`, one property per call. Like a port's baud rate, these live in `HARDWARE_PROPERTY` children; written onto the `HARDWARE_COM_CMD` start tag they are accepted everywhere and the command keeps polling its old register. Remember the first register is one-based -- see `references/xcskr-structure.md`.
 - Fill in per-element descriptions. An array member nests one `VARIABLE_MEMBER` per element, each with its own `DESC`, and that is what the variable monitor shows beside `Name[57]`; without it an engineer has to go back to a lookup table mid-commissioning. Fill them by rewriting one element's `DESC` attribute in place -- never by round-tripping the document through ElementTree, which reformats the whole file. `rebuild-variable-members` preserves them (reporting `keptDesc=N`), so the order of that work no longer matters. *Verified on 5.1.0.*
 - Keep every `DESC` inside the GUI's description length limit (`描述长度超过%d个字符的限制！`; **128** observed on 5.1.0). The XML accepts any length, so an over-long description written by a tool loads, compiles and runs -- and then silently blocks whoever next opens that field in the GUI from saving the dialog at all. `validate-desc-length` reports it; `check-workspace` runs it. Whether the limit counts characters or GBK bytes is unverified, so stay inside it both ways: a Chinese description costs two bytes per character.
+- Write `ELSEIF`, not `ELSIF`. The dialect rejects the IEC 61131-3 spelling at compile time (`不允许使用ELSIF`) and accepts only `ELSEIF`; the same source with the keyword swapped compiles (verified on 5.1.0). Neither official sample uses either spelling, so nothing else warns.
+- Disabling a PDO channel in the GUI writes three things: the channel tag `ENABLE="NO"`, the group `HARDWARE_GROUP_ENABLE="NO"`, and command id `0` on the nested `HARDWARE_CAN_CMD` (verified by ticking and unticking a driver station's RPDO in the GUI and diffing). A tag left `ENABLE="YES"` under a disabled group is therefore a tool-made leftover, not a GUI shape; harmless, but bring it back to the GUI shape when you touch it. Run `validate-command-directions` after every GUI session: a PDO group ticked for a look and never unticked becomes an output the master sends as constant zeros every cycle.
 - Enabling a CANopen object takes **three** writes, not two: the channel tag's `ENABLE`, the group's `HARDWARE_GROUP_ENABLE`, and a **command id** on `HARDWARE_CAN_CMD@ID`. The GUI hands out the id when you tick the group; `set-attrs --kind cmd-group` does not, so always follow it with `alloc-canopen-command-ids`. Skipping the id costs a build with no clue in it: the compiler blames every program that uses the tag with `文本"<tag>"错误，字符串无法识别` on 第1行, and nothing mentions the command group (verified: 27 such groups -> 216 errors). Only uniqueness is required; see references/xcskr-structure.md for the numbering the GUI itself uses.
 - Use xRobotDesigner GUI compile/download as the final authority. Static XML checks only prove that the edited file is structurally sane enough to hand back for GUI validation.
 - Close xRobotDesigner before writing to a project from here. The GUI holds its own in-memory copy and a single save overwrites the whole file, so a CLI edit made while the project is open is lost without any error. An ordinary text editor such as VSCode holds no exclusive lock and does not need to be closed.

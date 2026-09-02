@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -1675,6 +1676,389 @@ class XcskrToolTests(unittest.TestCase):
             self.assertIn("Problems=0", result.stdout)
             self.assertIn("OverBytes=1", result.stdout)
             self.assertIn("OVER_BYTES", result.stdout)
+
+    # ------------------------------------------------------------------
+    # Deleting and renaming: struct members, POUs, CANopen slave objects.
+    # Every one of these has to prove three things -- it removes what was
+    # asked, it refuses while something still points at it, and it leaves
+    # every other byte of the project alone.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def changed_lines(before: str, after: str) -> tuple[list[str], list[str]]:
+        """(removed, added) lines, so a test can show nothing else moved."""
+        diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0))
+        removed: list[str] = []
+        added: list[str] = []
+        for line in diff[2:]:
+            if line.startswith("@@"):
+                continue
+            (removed if line.startswith("-") else added).append(line[1:])
+        return removed, added
+
+    def project_with_wheel_struct(self, folder: Path) -> Path:
+        """A struct used three ways: plain, as an array, and nested in another."""
+        project = self.make_project(folder)
+        run_tool("add-user-struct", "--project", str(project), "--name", "WheelData",
+                 "--member", "Enable:BOOL:takes part", "--member", "Angle:DINT:angle",
+                 "--no-backup")
+        run_tool("add-user-struct-member", "--project", str(project), "--struct", "WheelData",
+                 "--member", "Spare:BOOL[2]:reserved bits", "--no-backup")
+        run_tool("add-user-struct", "--project", str(project), "--name", "MachineData",
+                 "--member", "Axis:WheelData:one wheel", "--no-backup")
+        run_tool("add-variable", "--project", str(project), "--name", "Wheel",
+                 "--datatype", "WheelData[4]", "--no-backup")
+        run_tool("add-variable", "--project", str(project), "--name", "Mach",
+                 "--datatype", "MachineData", "--no-backup")
+        return project
+
+    def test_remove_user_struct_member_rebuilds_every_variable_using_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.project_with_wheel_struct(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            result = run_tool("remove", "--project", str(project), "--kind", "user-struct-member",
+                              "--struct", "WheelData", "--member", "Angle", "--no-backup")
+
+            self.assertIn("RemovedStructMember=WheelData.Angle", result.stdout)
+            self.assertIn("rebuiltVariables=2", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            removed, added = self.changed_lines(before, after)
+            # A pure deletion: the struct member, one per array element, and the
+            # nested copy.  Anything else in the added list would mean the
+            # rebuild reformatted a variable it was only supposed to trim.
+            self.assertEqual(added, [])
+            self.assertTrue(all("Angle" in line for line in removed), removed)
+            self.assertEqual(len(removed), 6)
+            self.assertNotIn('NAME="Wheel[0].Angle"', after)
+            self.assertIn('NAME="Wheel[0].Enable"', after)
+            self.assertIn('NAME="Mach.Axis.Enable"', after)
+
+            clean = run_tool("validate-datatypes", "--project", str(project), "--strict")
+            self.assertIn("Problems=0", clean.stdout)
+
+    def test_remove_user_struct_member_handles_an_expanded_array_member(self) -> None:
+        # An array member of a user data type is written as a parent element
+        # with one child per element -- the same tag nested inside itself.  A
+        # close-tag search that stops at the first `</USER_STRUCT_MEMBER>`
+        # deletes half the element and leaves the project unparseable.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.project_with_wheel_struct(Path(temp))
+
+            result = run_tool("remove", "--project", str(project), "--kind", "user-struct-member",
+                              "--struct", "WheelData", "--member", "Spare", "--no-backup")
+
+            self.assertIn("RemovedStructMember=WheelData.Spare", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn("Spare", after)
+            self.assertNotIn("</USER_STRUCT_MEMBER>", after)
+            clean = run_tool("validate-datatypes", "--project", str(project), "--strict")
+            self.assertIn("Problems=0", clean.stdout)
+
+    def test_remove_user_struct_member_refuses_while_st_still_reads_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            project = self.project_with_wheel_struct(temp_path)
+            run_tool("replace-st", "--project", str(project), "--pou-type", "program",
+                     "--name", "CycleProgram",
+                     "--st-file", str(self.write_st(temp_path, "Wheel[0].Angle := 1;\n")),
+                     "--no-backup")
+            before = project.read_text(encoding="gbk", newline="")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "user-struct-member",
+                               "--struct", "WheelData", "--member", "Angle", "--no-backup",
+                               check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("st:program:CycleProgram", refused.stderr)
+            self.assertIn("Wheel[*].Angle", refused.stderr)
+            self.assertEqual(project.read_text(encoding="gbk", newline=""), before)
+
+            forced = run_tool("remove", "--project", str(project), "--kind", "user-struct-member",
+                              "--struct", "WheelData", "--member", "Angle", "--force", "--no-backup")
+
+            self.assertIn("forcedOverReferences=1", forced.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn('NAME="Wheel[0].Angle"', after)
+            # The ST is left exactly as written; --force removes the member, it
+            # does not rewrite the code that used it.
+            self.assertIn("Wheel[0].Angle := 1;", after)
+
+    def test_remove_user_struct_member_refuses_while_a_mapping_names_it(self) -> None:
+        # A Modbus or CANopen mapping holds the member path as plain text.  The
+        # member's removal does not disturb it, and nothing reports the mapping
+        # as dangling afterwards.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool("add-variable", "--project", str(project), "--name", "Drive",
+                     "--datatype", "DriveStatus", "--no-backup")
+            raw = project.read_text(encoding="gbk", newline="")
+            project.write_text(raw.replace('TAG_NAME="StatusWords[1]"', 'TAG_NAME="Drive.Position"'),
+                               encoding="gbk", newline="")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "user-struct-member",
+                               "--struct", "DriveStatus", "--member", "Position", "--no-backup",
+                               check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("slave-object", refused.stderr)
+            self.assertIn("Drive.Position", refused.stderr)
+
+    def test_remove_user_struct_member_dry_run_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.project_with_wheel_struct(Path(temp))
+            before = project.read_bytes()
+
+            result = run_tool("remove", "--project", str(project), "--kind", "user-struct-member",
+                              "--struct", "WheelData", "--member", "Angle", "--dry-run")
+
+            self.assertIn("DRY_RUN=OK", result.stdout)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_remove_function_block_refuses_while_it_is_called(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "pou",
+                               "--pou-type", "function-block", "--name", "FB_SCALE",
+                               "--no-backup", check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("st:program:MainProgram", refused.stderr)
+            self.assertEqual(project.read_text(encoding="gbk", newline=""), before)
+
+            forced = run_tool("remove", "--project", str(project), "--kind", "pou",
+                              "--pou-type", "function-block", "--name", "FB_SCALE",
+                              "--force", "--no-backup")
+
+            self.assertIn("Removed=pou:function-block:FB_SCALE", forced.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn('NAME="FB_SCALE"', after)
+            self.assertIn("<FUNCTION_BLOCK_LIST>", after)
+            # The caller is untouched; only the declaration went away.
+            self.assertIn("FB_SCALE(InValue:=1", after)
+
+    def test_remove_function_block_sees_a_graphical_block_type(self) -> None:
+        # A graphical block names its type and nothing else; deleting the block
+        # type leaves a page the GUI cannot draw.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool("add-function-block", "--project", str(project), "--name", "MOV",
+                     "--desc", "generic move", "--no-backup")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "pou",
+                               "--pou-type", "function-block", "--name", "MOV",
+                               "--no-backup", check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("graphic:program:LadderProgram", refused.stderr)
+            self.assertIn("_MODULE1", refused.stderr)
+
+    def test_remove_program_leaves_the_rest_of_the_task_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            result = run_tool("remove", "--project", str(project), "--kind", "pou",
+                              "--pou-type", "program", "--name", "CycleProgram", "--no-backup")
+
+            self.assertIn("Removed=pou:program:CycleProgram", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            removed, added = self.changed_lines(before, after)
+            self.assertEqual(added, [])
+            self.assertEqual(len(removed), 3)
+            listing = run_tool("list-pous", "--project", str(project))
+            self.assertNotIn("CycleProgram", listing.stdout)
+            self.assertIn("LadderProgram", listing.stdout)
+            self.assertIn("ChassisProgram", listing.stdout)
+
+    def test_removing_an_event_task_program_says_the_task_is_now_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("remove", "--project", str(project), "--kind", "pou",
+                              "--pou-type", "program", "--name", "EventProgram", "--no-backup")
+
+            self.assertIn("EVENT_TASK ID=2 now holds no program", result.stdout)
+            self.assertIn("add-program", result.stdout)
+            tasks = run_tool("list-tasks", "--project", str(project))
+            self.assertIn("event", tasks.stdout)
+
+    def test_remove_pou_dry_run_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_bytes()
+
+            result = run_tool("remove", "--project", str(project), "--kind", "pou",
+                              "--pou-type", "program", "--name", "CycleProgram", "--dry-run")
+
+            self.assertIn("DRY_RUN=OK", result.stdout)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_rename_function_block_moves_call_sites_and_block_types(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            result = run_tool("rename-pou", "--project", str(project), "--pou-type", "function-block",
+                              "--name", "FB_SCALE", "--new-name", "Scaler", "--no-backup")
+
+            self.assertIn("RenamedPou=function-block:FB_SCALE -> Scaler", result.stdout)
+            self.assertIn("calls=1", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn("FB_SCALE", after)
+            self.assertIn("Scaler(InValue:=1, Scale=>StatusWords[0]);", after)
+            # The interface came along with the declaration, so the call is
+            # still in declaration order.
+            calls = run_tool("validate-fb-calls", "--project", str(project))
+            self.assertIn("FB_CALLS=OK", calls.stdout)
+
+    def test_rename_function_block_retypes_a_graphical_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool("add-function-block", "--project", str(project), "--name", "MOV", "--no-backup")
+
+            result = run_tool("rename-pou", "--project", str(project), "--pou-type", "function-block",
+                              "--name", "MOV", "--new-name", "Move2", "--no-backup")
+
+            self.assertIn("blocks=1", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertIn('TYPE="Move2"', after)
+            self.assertNotIn('TYPE="MOV"', after)
+
+    def test_rename_program_touches_only_its_own_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            result = run_tool("rename-pou", "--project", str(project), "--pou-type", "program",
+                              "--name", "CycleProgram", "--new-name", "SlowLoop", "--no-backup")
+
+            self.assertIn("RenamedPou=program:CycleProgram -> SlowLoop", result.stdout)
+            self.assertIn("calls=0", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            removed, added = self.changed_lines(before, after)
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(len(added), 1)
+            self.assertIn('NAME="CycleProgram"', removed[0])
+            self.assertIn('NAME="SlowLoop"', added[0])
+
+    def test_rename_pou_refuses_a_name_already_in_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            pou = run_tool("rename-pou", "--project", str(project), "--pou-type", "program",
+                           "--name", "CycleProgram", "--new-name", "MainProgram",
+                           "--no-backup", check=False)
+            self.assertEqual(pou.returncode, 2)
+            self.assertIn("already exists", pou.stderr)
+
+            variable = run_tool("rename-pou", "--project", str(project), "--pou-type", "function-block",
+                                "--name", "FB_SCALE", "--new-name", "SystemReady",
+                                "--no-backup", check=False)
+            self.assertEqual(variable.returncode, 2)
+            self.assertIn("VARIABLE", variable.stderr)
+
+            tag = run_tool("rename-pou", "--project", str(project), "--pou-type", "function-block",
+                           "--name", "FB_SCALE", "--new-name", "Axis1_Position_6004",
+                           "--no-backup", check=False)
+            self.assertEqual(tag.returncode, 2)
+            self.assertIn("HARDWARE_CHANNEL_TAG", tag.stderr)
+
+    def test_rename_pou_dry_run_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_bytes()
+
+            result = run_tool("rename-pou", "--project", str(project), "--pou-type", "function-block",
+                              "--name", "FB_SCALE", "--new-name", "Scaler", "--dry-run")
+
+            self.assertIn("DRY_RUN=OK", result.stdout)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_remove_slave_object_refuses_while_variables_are_mapped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "slave-object",
+                               "--port-id", "8", "--index", "0x2000", "--no-backup", check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("StatusWords[0]", refused.stderr)
+            self.assertEqual(project.read_text(encoding="gbk", newline=""), before)
+
+            forced = run_tool("remove", "--project", str(project), "--kind", "slave-object",
+                              "--port-id", "8", "--index", "8192", "--force", "--no-backup")
+
+            self.assertIn("RemovedSlaveObject=port 8 index 0x2000", forced.stdout)
+            self.assertIn("mappings=2", forced.stdout)
+            self.assertIn("validate-slave-objects", forced.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            removed, added = self.changed_lines(before, after)
+            self.assertEqual(added, [])
+            self.assertEqual(len(removed), 4)
+            self.assertNotIn("HARDWARE_CAN_SLAVER_OBJECT", after)
+
+    def test_remove_slave_object_takes_the_index_in_hex_or_decimal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            raw = project.read_text(encoding="gbk", newline="")
+            eol = "\r\n" if "\r\n" in raw else chr(10)
+            spare = ('<HARDWARE_CAN_SLAVER_OBJECT INDEX="8193" DESC="Spare" DATATYPE="uint32" '
+                     'ARRAY_FLAG="YES" ARRAY_SIZE="2" ENABLE="YES" PDO_INDEX="6657" '
+                     'PDO_DESC="Transmit PDO 2" />')
+            raw = raw.replace("</HARDWARE_CAN_SLAVER_OBJECT>",
+                              "</HARDWARE_CAN_SLAVER_OBJECT>" + eol + "        " + spare)
+            project.write_text(raw, encoding="gbk", newline="")
+            before = project.read_text(encoding="gbk", newline="")
+
+            result = run_tool("remove", "--project", str(project), "--kind", "slave-object",
+                              "--port-id", "8", "--index", "0x2001", "--no-backup")
+
+            self.assertIn("RemovedSlaveObject=port 8 index 0x2001", result.stdout)
+            self.assertIn("mappings=0", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            removed, added = self.changed_lines(before, after)
+            self.assertEqual(added, [])
+            self.assertEqual(len(removed), 1)
+            self.assertIn('DESC="Spare"', removed[0])
+            objects = run_tool("list-slave-objects", "--project", str(project))
+            self.assertIn("0x2000", objects.stdout)
+            self.assertNotIn("0x2001", objects.stdout)
+
+    def test_remove_slave_object_dry_run_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_bytes()
+
+            result = run_tool("remove", "--project", str(project), "--kind", "slave-object",
+                              "--port-id", "8", "--index", "0x2000", "--force", "--dry-run")
+
+            self.assertIn("DRY_RUN=OK", result.stdout)
+            self.assertEqual(project.read_bytes(), before)
+
+    def test_set_attrs_writes_port_enable_onto_the_port_tag(self) -> None:
+        # ENABLE is a start-tag attribute, unlike the baud rate and the
+        # termination resistor next to it in the GUI, which are
+        # HARDWARE_PROPERTY children.  Routed to a child it would create a
+        # property nothing reads and leave the port enabled.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            result = run_tool("set-attrs", "--project", str(project), "--kind", "downlink-port",
+                              "--port-id", "5", "--attr", "ENABLE=NO", "--no-backup")
+
+            self.assertIn("SetAttrs=downlink-port:5", result.stdout)
+            self.assertNotIn("downlink-port:5:ENABLE", result.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn('<HARDWARE_PROPERTY ID="ENABLE"', after)
+            removed, added = self.changed_lines(before, after)
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(len(added), 1)
+            self.assertIn('NAME="CAN1"', added[0])
+            self.assertIn('ENABLE="NO"', added[0])
 
     def test_cli_help_is_generic(self) -> None:
         result = run_tool("--help")

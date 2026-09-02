@@ -62,6 +62,18 @@ single project.
   or `&#x0D;&#x0A;` with tabs as `&#x09;`, depending on the version that wrote
   the file. All three read back correctly, so a rewrite keeps the existing style
   instead of normalizing it.
+- **A parsed `CONTENT` has no line structure when the file stored literal line
+  breaks.** XML attribute-value normalization replaces a literal LF, CR or TAB
+  inside an attribute value with a space; only the numeric-reference forms
+  survive parsing. So the same ST body reaches an XML reader as one long line or
+  as many, depending on which version wrote it, and a line number computed from
+  the parsed value is `1` for every match in a literal-LF POU -- wrong, and
+  wrong quietly. Count lines on the **raw** attribute text instead, matching
+  `\n` and `&#10;` / `&#xA;` (the LF half of a CRLF pair, so a pair still ends
+  one line); `st_raw_line_number` does this. *Verified three ways: parsing
+  `C="one\ntwo"`, `C="one&#10;two"` and `C="one&#x0D;&#x0A;two"` returns
+  `'one two'`, `'one\ntwo'` and `'one\r\ntwo'`; and a production POU whose raw
+  `CONTENT` holds 693 literal LFs parses to zero newline characters.*
 
 ## Control Scheme And Tasks
 
@@ -142,6 +154,22 @@ integer types, `0.000` for `REAL`.
 - Function block pins are stored as `SECTION_VAR_INPUT`, `SECTION_VAR_OUTPUT`, and `SECTION_VAR_INTERNAL`.
 - A function block can have valid pins while its ST content is empty; inspect both interface and ST.
 - Raw ST line breaks can be literal LF, `&#10;`, or `&#x0D;&#x0A;`; all three are valid and the writer keeps whichever is already there.
+- **A POU is self-contained.** Its logic and its interface are children of its
+  own element, and no element outside it repeats its name: a task owns its
+  programs by containment and document order, not by name. So deleting the
+  element deletes the POU whole, and renaming a program is a one-attribute edit
+  with nothing to follow. *Verified by inventorying every element and attribute
+  name in two production projects and searching each for the POU names: the only
+  structural hit is the POU's own start tag; every other occurrence is prose
+  inside an ST comment.* `SECTION_LOGIC_*` carries no `NAME` in any observed
+  project (zero occurrences in both), so the empty `NAME=""` some versions wrote
+  is stripped rather than maintained -- a rename still moves a non-empty one if
+  it ever meets one.
+- A **function block** is the opposite case: nothing declares an instance of it,
+  so every use is a spelling of its type -- a bare ST call `Block(pin:=..)`, or a
+  graphical `CONTROL_LOGIC_BLOCK@TYPE`. Neither moves with the declaration, so a
+  rename or a removal has to find them; `rename-pou` rewrites both and
+  `remove --kind pou` refuses while any exist.
 
 ## Graphical Logic: LD And FBD
 
@@ -358,6 +386,34 @@ an import format, not the project format, and it does not set the convention her
 expanded shape directly. The variable-instance side is unaffected --
 `rebuild-variable-members` already expanded `VARIABLE_MEMBER` trees correctly.
 
+**Consequence for any edit that locates one member: `USER_STRUCT_MEMBER` is the
+one tag in this format that contains its own kind.** Finding an element by
+taking the first `</USER_STRUCT_MEMBER>` after the start tag returns the first
+*child's* close tag, so an expanded array member gets cut in half; delete that
+span and a stray close tag is left behind and the project no longer parses.
+Match close tags by depth instead -- `find_nested_element_span` does. A flat
+member is self-closing and cannot show the problem, which is why it only
+surfaces on the expanded shape the GUI actually writes.
+
+## Removing one member of a user data type
+
+A member exists twice over: once in the `USER_STRUCT` definition, and once per
+variable built on that type as a generated `VARIABLE_MEMBER`. Deleting only the
+definition leaves every such variable declaring a member of a type that no
+longer exists; the project still parses and only `validate-datatypes` notices.
+`remove --kind user-struct-member` therefore deletes the definition and then
+rebuilds each affected variable through the same code path as
+`rebuild-variable-members`, so per-element descriptions survive.
+
+Which variables are affected is a walk, not a lookup: a type is used directly,
+through an array, and nested inside another type, and all three own generated
+children. The same walk produces the spellings a program can use for the member
+-- `Plant.Hours`, `Wheel[*].Angle`, `Plant.Axis.Angle` -- because a user data
+type never appears in code by its own name; it reaches ST, graphical pin
+bindings and mapping tables only through the variables declared with it. The
+subscript has to stay a wildcard: real code indexes with a loop counter, so
+enumerating literal indexes finds nothing.
+
 ## Hardware Configuration And Hardware Variables
 
 Common downlink structure:
@@ -516,12 +572,31 @@ start-tag attribute is refused because they are different elements.
 *Verified: `CAN_BAUD` written onto the start tag left the port at its
 previous rate, with no warning from the compiler or the GUI.*
 
+`ENABLE` is the exception worth naming, because in the GUI it sits on the same
+page as the baud rate and the termination resistor: it is a **start-tag
+attribute**, not a `HARDWARE_PROPERTY`. `set-attrs --kind downlink-port --attr
+ENABLE=NO` is correct as it stands and reports `downlink-port:<id>` with no
+property suffix -- here that short form is the right answer, not the warning
+sign it is for a baud rate. *Verified by writing it on an enabled port and
+reading the start tag back: `ENABLE="NO"` on the tag, and no
+`HARDWARE_PROPERTY ID="ENABLE"` created anywhere.*
+
 ### `DISPLAY` is a label, not an identifier
 
-Two downlink ports can carry the same `DISPLAY` string. A controller whose CAN
-port can act as either master or slave exposes both roles as separate ports, and
-both read the same `DISPLAY` while differing in `ID`, `NAME` and `PHYSICAL_ID`
--- the `NAME` of one of them need not resemble the `DISPLAY` at all.
+Two downlink ports can carry the same `DISPLAY` string. The port list of a
+project is a mirror of the controller's vendor device file
+(`Resource/<lang>/Hardware/Device/<version>/<Model>.xml`, element `<Ports>`):
+one `HARDWARE_DEVICE_DOWNLINK_PORT` per `<Port>` in document order, `ID`
+counting up from 1, `PHYSICAL_ID` equal to the device file's hexadecimal port
+`id` in decimal, `TYPE` from the port `type` (`ethernet` 0, `com` 1,
+`can_motor` 3, `can_other` 4, `can_slave` 5), `DISPLAY` copied verbatim. When
+the vendor file itself lists two ports with the same `display` -- it happens
+when a smaller model's file was derived from a larger one and the surplus CAN
+ports were left in -- the project inherits both, and the one that drives the
+physical connector need not be the one whose `NAME` matches. Such surplus
+ports are not project residue: a project created fresh in the GUI has them
+too, and the two `RECT_POSITION` rectangles overlap because the device file
+gives both ports the same `left`/`right`.
 
 Locate a port by `ID` or `PHYSICAL_ID`. Matching on `NAME` or `DISPLAY` can
 silently pick the wrong port, and objects written under the wrong port are
@@ -532,10 +607,24 @@ Locating by proximity is the same trap in a different shape. Ports nest, so the
 nearest preceding `HARDWARE_DEVICE_DOWNLINK_PORT` tag before an object is not
 necessarily its parent; walk the element stack instead.
 
-*Verified on a production project: ports `ID="6"`
-(`NAME="CAN2"`, `PHYSICAL_ID="65"`) and `ID="8"` (`NAME="CAN4"`,
-`PHYSICAL_ID="67"`) both carry `DISPLAY="CAN2"`, and all 36 slave objects live
-under `ID="6"`.*
+What an unused port looks like in vendor-made files: a serial port is
+`ENABLE="NO"`; a CAN port is never disabled (`ENABLE="YES"`, and vendor model
+projects mark CAN ports `READ_ONLY="YES"`), an unused master port holds an
+empty `HARDWARE_NET`, and every `can_slave` port is born with eight template
+objects `0x2000`~`0x2007` (`uint8[8]`, one per RPDO/TPDO slot, no mappings)
+whether or not it is used. Deleting those ports or objects, or disabling a CAN
+port, produces a shape the GUI never writes; leave them and document which
+port is live.
+
+*Verified on a production project against its controller's device file: ports
+`ID="6"` (`NAME="CAN2"`, `PHYSICAL_ID="65"`) and `ID="8"` (`NAME="CAN4"`,
+`PHYSICAL_ID="67"`) both carry `DISPLAY="CAN2"` because the device file lists
+both with `display="CAN2"`; the hardware has two CAN connectors, on
+`PHYSICAL_ID` 64 and 67. The 36 slave objects split 8 / 8 / 20 across
+`ID="6"` / `"7"` / `"8"`, and the live dictionary (20 objects, all mappings) is
+under `ID="8"`. The port-list rule was checked against the earliest saved
+version of that project, a vendor-shipped model project and its device file,
+and an official sample project; a GUI-fresh project was not created.*
 
 ## A Modbus TCP server exposes variables through named mapping windows
 
@@ -1355,6 +1444,11 @@ Prefer these operations:
 - `add-user-struct`, `add-user-struct-member`, `add-variable`,
   `rebuild-variable-members`, `remove`: structured create and update of user data
   types and variables.
+- `remove --kind user-struct-member | pou | slave-object` and `rename-pou`:
+  deletions and renames that carry their dependants with them and refuse while
+  something still points at the target. `--force` overrides deliberately; it
+  never rewrites the code that referenced the target, so read the refusal list
+  before using it.
 - `set-pin`, `connect-pins`, `disconnect-line`, `copy-block`: graphical edits
   that only touch the pins, connections, lines and blocks named on the command line.
 
@@ -1495,6 +1589,12 @@ group both are the fault above.
 slave's `COMM_CHECK_WAY` setting: switching it from `""` to `1` (heartbeat) adds
 `TIMEOUT` on `HARDWARE_CAN_DEVICE_SLAVE`, flips the `CommFailed` group to
 `HARDWARE_GROUP_ENABLE="YES"` and moves its `DATOBJECT` from `3` to `4`.
+It is a `HARDWARE_CAN_CMD` carrying an allocated `ID` like any other, so **it spends
+a slot**: a station with eight ticked objects costs nine. Counting only the objects
+someone ticked undercounts the budget by one per checked station, and nothing in the
+file says otherwise. *verified by counting allocated `HARDWARE_CAN_CMD` ids against
+the total `validate-controller-support` reports, on a project with 16 identical
+slaves.*
 
 Enabling is budgeted: `max_canopen_cmd_cnt` in the device library caps the total
 number of enabled command groups per controller. The cap is **per controller model**,
@@ -1511,6 +1611,7 @@ easy to design against:
 |---|---|
 | A raw PDO channel (`XCS_TPDO1`, `XCS_RPDO1`, …) | **1 group per 8-byte PDO** |
 | A named SDO sub-index | **1 group per sub-index** — a `bool` costs the same as a `uint32` |
+| The auto-generated `CommFailed` | **1 group per station** whose `COMM_CHECK_WAY` is on |
 
 So an object declared `bool[8]` on the slave costs the master **8** groups to carry
 **8 bits**, while a `uint32[2]` riding a TPDO costs **1** group to carry 8 bytes.

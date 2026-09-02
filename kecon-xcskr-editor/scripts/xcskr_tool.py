@@ -2508,6 +2508,59 @@ def find_element_span(text: str, tag: str, predicate, offset: int = 0) -> tuple[
     raise ValueError(f"{tag} matching selector not found")
 
 
+def find_nested_element_span(text: str, tag: str, predicate, offset: int = 0) -> tuple[int, int, str, dict[str, str]]:
+    """Like `find_element_span`, but correct when a tag contains its own kind.
+
+    `find_element_span` takes the first `</TAG>` after the start tag, which is
+    right for every tag that cannot nest.  `USER_STRUCT_MEMBER` can: the GUI
+    writes an array member as a parent element with one child per array element,
+    so the plain search stops at the first child's close tag and returns half an
+    element.  Deleting that half leaves a stray `</USER_STRUCT_MEMBER>` behind
+    and the project no longer parses.
+    """
+    open_re = re.compile(START_TAG_RE_TEMPLATE.format(tag=re.escape(tag)), flags=re.DOTALL)
+    close = f"</{tag}>"
+    scan_re = re.compile(
+        re.escape(close) + "|" + START_TAG_RE_TEMPLATE.format(tag=re.escape(tag)),
+        flags=re.DOTALL,
+    )
+    for match in open_re.finditer(text):
+        start_tag = match.group(0)
+        attrs_map = parse_start_tag_attrs(start_tag)
+        if not predicate(attrs_map):
+            continue
+        if start_tag.rstrip().endswith("/>"):
+            return offset + match.start(), offset + match.end(), start_tag, attrs_map
+        depth, pos = 1, match.end()
+        while depth:
+            hit = scan_re.search(text, pos)
+            if hit is None:
+                raise ValueError(f"{tag} matching close tag not found")
+            token = hit.group(0)
+            if token == close:
+                depth -= 1
+            elif not token.rstrip().endswith("/>"):
+                depth += 1
+            pos = hit.end()
+        return offset + match.start(), offset + pos, text[match.start():pos], attrs_map
+    raise ValueError(f"{tag} matching selector not found")
+
+
+def parse_object_index(value: str) -> str:
+    """Normalize an object dictionary index to the decimal form the file stores.
+
+    The GUI and every datasheet name an object in hex (`0x2001`); the XML keeps
+    it as a decimal `INDEX`.  Accepting both means a command line can be copied
+    straight from the manual.
+    """
+    raw = (value or "").strip()
+    try:
+        number = int(raw, 16) if raw.lower().startswith("0x") else int(raw, 10)
+    except ValueError:
+        raise ValueError(f"--index must be decimal or 0x-prefixed hex: {value!r}") from None
+    return str(number)
+
+
 # A downlink port keeps its baud rate, termination and serial framing in
 # <HARDWARE_PROPERTY ID=".." VALUE=".."/> children, not on its own start tag.
 # Writing one of these onto the start tag is accepted by every text-level check
@@ -3221,12 +3274,18 @@ def insert_container_child(text: str, tag: str, build_child, predicate=None) -> 
     return text[:line_start] + child + eol + text[line_start:]
 
 
-def remove_element(text: str, tag: str, predicate) -> str:
-    start, end, _, _ = find_element_span(text, tag, predicate)
+def remove_element(text: str, tag: str, predicate, nested: bool = False) -> str:
+    finder = find_nested_element_span if nested else find_element_span
+    start, end, _, _ = finder(text, tag, predicate)
     line_start = text.rfind("\n", 0, start) + 1
     if not text[line_start:start].strip():
         start = line_start
-    if text[end:end + 1] == "\n":
+    # Take the element's own line break with it, whichever style the file uses.
+    # Consuming only a bare LF leaves the CR of a CRLF behind, which reads as a
+    # blank line the removal did not intend to add.
+    if text[end:end + 2] == "\r\n":
+        end += 2
+    elif text[end:end + 1] == "\n":
         end += 1
     return text[:start] + text[end:]
 
@@ -3314,6 +3373,206 @@ def variables_using_struct(root: ET.Element, struct_name: str) -> list[str]:
         if base == struct_name:
             users.append(attr(var, "NAME"))
     return users
+
+
+# A user data type can sit inside another one, so "which variables carry this
+# struct" is a walk, not a lookup.  Eight levels is the same ceiling
+# expected_member_tree() uses, and it also stops a struct that (illegally)
+# contains itself from looping forever.
+STRUCT_WALK_DEPTH_LIMIT = 8
+
+
+def variables_carrying_struct(root: ET.Element, struct_name: str) -> list[str]:
+    """Every VARIABLE whose member tree contains this user data type.
+
+    Direct (`Cfg : Plant_Data`), through an array (`Wheel : Wheel_Data[8]`) and
+    nested inside another struct (`Plant.Axis` where `Axis` is of this type) all
+    count -- each one owns `VARIABLE_MEMBER` children generated from this
+    struct's definition, so each one goes stale when the definition changes.
+    """
+    structs = collect_struct_defs(root)
+
+    def carries(datatype: str, depth: int) -> bool:
+        if depth > STRUCT_WALK_DEPTH_LIMIT:
+            return False
+        base, _, _ = parse_datatype(datatype)
+        if base == struct_name:
+            return True
+        return any(carries(field["datatype"], depth + 1) for field in structs.get(base, []))
+
+    return [attr(var, "NAME") for var in root.iter("VARIABLE") if carries(attr(var, "DATATYPE"), 0)]
+
+
+def member_path_regex(display: str) -> re.Pattern[str]:
+    """Compile one member path skeleton into the reference pattern to search for.
+
+    `[*]` stands for any subscript because real code indexes with a loop
+    counter (`Wheel[i].Angle`), which enumerating literal indexes would miss.
+    Whitespace is allowed around each `.` and `[` for the same reason: the
+    editor accepts it and some hand-written lines have it.
+    """
+    parts: list[str] = []
+    for chunk in re.split(r"(\[\*\])", display):
+        if chunk == "[*]":
+            parts.append(r"\s*\[[^\]]*\]")
+        elif chunk:
+            parts.append(r"\s*\.\s*".join(re.escape(piece) for piece in chunk.split(".")))
+    return re.compile(r"(?<![A-Za-z0-9_.])" + "".join(parts) + r"(?![A-Za-z0-9_])")
+
+
+def struct_member_paths(root: ET.Element, struct_name: str, member_name: str) -> list[tuple[str, re.Pattern[str]]]:
+    """Every way a program can spell this struct member, as (display, regex).
+
+    A user data type never appears in code by its own name -- it reaches ST,
+    graphical bindings and Modbus mappings only through the variables declared
+    with it.  So the spellings are derived from the variable table:
+    `Plant.Hours` for a plain variable, `Wheel[*].Angle` for an array of the
+    struct, `Plant.Axis.Angle` when the struct is nested inside another one.
+    """
+    structs = collect_struct_defs(root)
+    found: list[tuple[str, re.Pattern[str]]] = []
+    seen: set[str] = set()
+
+    def walk(path: str, datatype: str, depth: int) -> None:
+        if depth > STRUCT_WALK_DEPTH_LIMIT:
+            return
+        base, count, _ = parse_datatype(datatype)
+        if count is not None:
+            walk(path + "[*]", base, depth + 1)
+            return
+        if base == struct_name:
+            display = path + "." + member_name
+            if display not in seen:
+                seen.add(display)
+                found.append((display, member_path_regex(display)))
+        for field in structs.get(base, []):
+            walk(path + "." + field["name"], field["datatype"], depth + 1)
+
+    for var in root.iter("VARIABLE"):
+        walk(attr(var, "NAME"), attr(var, "DATATYPE"), 0)
+    return found
+
+
+# Line breaks a POU's raw CONTENT may use.  The parsed attribute value cannot be
+# used to count them: an XML parser normalizes `&#x0D;&#x0A;` in an attribute to
+# spaces, so every ST body stored that way arrives as a single line and every
+# reported line number would be 1.  The raw attribute text still shows them.
+# Only the LF half of each style is counted, so a CRLF pair -- literal or
+# written as `&#x0D;&#x0A;` -- still ends exactly one line.
+ST_RAW_LINE_BREAK_RE = re.compile(r"\n|&#(?:10|x0*[Aa]);")
+
+
+def st_raw_line_number(raw_content: str, index: int) -> int:
+    """Line number of an offset inside a raw SECTION_LOGIC_ST CONTENT value."""
+    return sum(1 for _ in ST_RAW_LINE_BREAK_RE.finditer(raw_content, 0, index)) + 1
+
+
+def struct_member_references(text: str, root: ET.Element, struct_name: str, member_name: str) -> list[dict[str, object]]:
+    """Where a struct member is still used, so a removal can refuse to be silent.
+
+    Four places can name it and all four survive the member's deletion without
+    a word from the compiler in some cases: ST code, a graphical pin binding, a
+    Modbus mapping window or CANopen object mapping, and a command group's tag
+    name.  ST comments are blanked first -- a member mentioned in prose is not
+    a dependency, and refusing on one would make the gate useless.
+    """
+    paths = struct_member_paths(root, struct_name, member_name)
+    rows: list[dict[str, object]] = []
+    if not paths:
+        return rows
+
+    for pou_type, tag in POU_TAGS.items():
+        raw_st = raw_st_content_by_name(text, tag)
+        for pou in root.findall(f".//{tag}"):
+            pou_name = attr(pou, "NAME")
+            raw = raw_st.get(pou_name)
+            if raw:
+                masked = blank_st_comments(raw)
+                for display, pattern in paths:
+                    hit = pattern.search(masked)
+                    if hit:
+                        rows.append({
+                            "where": f"st:{pou_type}:{pou_name}",
+                            "line": st_raw_line_number(raw, hit.start()),
+                            "detail": display,
+                        })
+            for block in pou.iter("CONTROL_LOGIC_BLOCK"):
+                for conn in block.iter("CONTROL_BLOCK_CONNECTION"):
+                    if conn.get("CONNECTION_TYPE") != CONNECTION_TYPE_VARIABLE:
+                        continue
+                    value = conn.get("CONNECTION_VALUE", "")
+                    for display, pattern in paths:
+                        if pattern.search(value):
+                            rows.append({
+                                "where": f"graphic:{pou_type}:{pou_name}:{attr(block, 'NAME')}",
+                                "line": "",
+                                "detail": value,
+                            })
+
+    parent = {child: elem for elem in root.iter() for child in elem}
+    for mapping in root.iter("HARDWARE_MODBUS_TAG_MAPPING"):
+        value = mapping.get("TAG_NAME", "")
+        owner = parent.get(mapping)
+        kind = "slave-object" if owner is not None and owner.tag == "HARDWARE_CAN_SLAVER_OBJECT" else "modbus-window"
+        label = "" if owner is None else (owner.get("NAME") or owner.get("INDEX") or "")
+        for display, pattern in paths:
+            if pattern.search(value):
+                rows.append({"where": f"{kind}:{label}", "line": "", "detail": value})
+
+    for group in root.iter("HARDWARE_CAN_CMD_GROUP"):
+        value = group.get("HARDWARE_CMD_TAG_NAME", "")
+        for display, pattern in paths:
+            if pattern.search(value):
+                rows.append({"where": "cmd-group", "line": "", "detail": value})
+
+    return rows
+
+
+def pou_references(text: str, root: ET.Element, pou_type: str, name: str) -> list[dict[str, object]]:
+    """Every call site of a function block or function: ST calls and block TYPEs.
+
+    A Kecon ST call names the type directly (`Ramp(In:=..)`), so a bare name
+    followed by `(` is the call.  The POU's own body is skipped: it goes away
+    with the POU.  A program has no callers -- a task holds it and document
+    order is the only thing referring to it -- so this returns nothing for one.
+    """
+    if pou_type == "program":
+        return []
+    call_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"\s*\(")
+    rows: list[dict[str, object]] = []
+    for kind, tag in POU_TAGS.items():
+        raw_st = raw_st_content_by_name(text, tag)
+        for pou in root.findall(f".//{tag}"):
+            owner = attr(pou, "NAME")
+            if kind == pou_type and owner == name:
+                continue
+            raw = raw_st.get(owner)
+            if raw:
+                masked = blank_st_comments(raw)
+                for hit in call_re.finditer(masked):
+                    rows.append({
+                        "where": f"st:{kind}:{owner}",
+                        "line": st_raw_line_number(raw, hit.start()),
+                        "detail": name + "(",
+                    })
+            for block in pou.iter("CONTROL_LOGIC_BLOCK"):
+                if attr(block, "TYPE") == name:
+                    rows.append({
+                        "where": f"graphic:{kind}:{owner}",
+                        "line": "",
+                        "detail": "block " + attr(block, "NAME"),
+                    })
+    return rows
+
+
+def format_references(rows: list[dict[str, object]], limit: int = 20) -> str:
+    lines = [
+        "  {0}{1}  {2}".format(row["where"], f":{row['line']}" if row["line"] else "", row["detail"])
+        for row in rows[:limit]
+    ]
+    if len(rows) > limit:
+        lines.append(f"  ... and {len(rows) - limit} more")
+    return "\n".join(lines)
 
 
 def cmd_add_user_struct(args: argparse.Namespace) -> int:
@@ -3575,15 +3834,26 @@ def cmd_add_variable(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_rebuild_variable_members(args: argparse.Namespace) -> int:
-    text = read_text(args.project, args.encoding)
-    root = parse_xml(text)
-    structs = collect_struct_defs(root)
+def rebuild_variable_members_in_text(
+    text: str,
+    structs: dict[str, list[dict[str, str]]],
+    name: str,
+    *,
+    element_init: str = "",
+    member_readonly: str | None = None,
+    drop_element_desc: bool = False,
+) -> tuple[str, str, int, int]:
+    """Regenerate one VARIABLE's member tree in place; returns the patched text.
+
+    Split out of `rebuild-variable-members` so that anything changing a user
+    data type can put the variables built on it back in step without a second
+    implementation of the same tree walk -- and without losing the per-element
+    descriptions, which live only on the variable.
+    """
     start, end, raw, attrs = find_element_span(
-        text, "VARIABLE", lambda attrs_map: attrs_map.get("NAME") == args.name
+        text, "VARIABLE", lambda attrs_map: attrs_map.get("NAME") == name
     )
     datatype = attrs.get("DATATYPE", "")
-    check_datatype(datatype, structs, args.allow_unknown_datatype)
     line_start = text.rfind("\n", 0, start) + 1
     indent = text[line_start:start]
     if indent.strip():
@@ -3594,25 +3864,49 @@ def cmd_rebuild_variable_members(args: argparse.Namespace) -> int:
     start_tag = start_tag_match.group(0)
     open_tag = start_tag.rstrip()[:-2].rstrip() + ">" if start_tag.rstrip().endswith("/>") else start_tag
 
-    preserve = {} if args.drop_element_desc else harvest_member_descs(raw)
+    preserve = {} if drop_element_desc else harvest_member_descs(raw)
+    # One level in from the variable, using the file's own step -- the same
+    # arithmetic add-variable does, so a rebuild of an untouched variable is
+    # byte-identical instead of quietly reindenting it.
+    step = indent_step(text)
     body, generated = render_variable_children(
-        args.name,
+        name,
         datatype,
         structs,
-        indent + "    ",
-        element_init=resolve_element_init(args.element_init),
+        indent + step,
+        element_init=element_init,
         visible=attrs.get("VISIBLE", "YES"),
         cold_retain=attrs.get("COLD_RETAIN", "NO"),
-        readonly=resolve_member_readonly(root, args.member_readonly),
-        step=indent_step(text),
+        readonly=member_readonly,
+        step=step,
         preserve_desc=preserve,
     )
     if body:
         replacement = open_tag + "\n" + body + "\n" + indent + "</VARIABLE>"
     else:
         replacement = start_tag if start_tag.rstrip().endswith("/>") else open_tag[:-1].rstrip() + "/>"
+    replacement = to_document_eol(replacement, text)
     new_text = text[:start] + replacement + text[end:]
     carried = sum(1 for member_name in preserve if f'NAME="{member_name}"' in replacement)
+    return new_text, datatype, generated, carried
+
+
+def cmd_rebuild_variable_members(args: argparse.Namespace) -> int:
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    structs = collect_struct_defs(root)
+    _, _, _, attrs = find_element_span(
+        text, "VARIABLE", lambda attrs_map: attrs_map.get("NAME") == args.name
+    )
+    check_datatype(attrs.get("DATATYPE", ""), structs, args.allow_unknown_datatype)
+    new_text, datatype, generated, carried = rebuild_variable_members_in_text(
+        text,
+        structs,
+        args.name,
+        element_init=resolve_element_init(args.element_init),
+        member_readonly=resolve_member_readonly(root, args.member_readonly),
+        drop_element_desc=args.drop_element_desc,
+    )
     return finish_write(
         args,
         new_text,
@@ -3620,7 +3914,164 @@ def cmd_rebuild_variable_members(args: argparse.Namespace) -> int:
     )
 
 
+def remove_user_struct_member(args: argparse.Namespace) -> int:
+    """Drop one member of a user data type and put every variable back in step.
+
+    The member exists twice over: once in the `USER_STRUCT` definition and once
+    per variable built on that struct, as generated `VARIABLE_MEMBER` children.
+    Deleting only the definition leaves every variable declaring a member of a
+    type that no longer exists -- the project still parses, and
+    `validate-datatypes` is the only thing that notices.
+    """
+    if not args.struct or not args.member:
+        raise ValueError("--struct and --member are required for kind=user-struct-member")
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+
+    struct = next(
+        (item for item in root.findall(".//USER_DATA_TYPE/USER_STRUCT") if attr(item, "NAME") == args.struct),
+        None,
+    )
+    if struct is None:
+        raise ValueError(f"USER_STRUCT {args.struct!r} not found")
+    if not any(attr(item, "NAME") == args.member for item in struct.findall("./USER_STRUCT_MEMBER")):
+        raise ValueError(f"USER_STRUCT {args.struct!r} has no member {args.member!r}")
+
+    refs = struct_member_references(text, root, args.struct, args.member)
+    if refs and not args.force:
+        raise ValueError(
+            f"{args.struct}.{args.member} is still referenced in {len(refs)} place(s):\n"
+            + format_references(refs)
+            + "\npass --force to remove it anyway"
+        )
+
+    struct_start, struct_end, struct_raw, _ = find_element_span(
+        text, "USER_STRUCT", lambda attrs_map: attrs_map.get("NAME") == args.struct
+    )
+    trimmed = remove_element(
+        struct_raw, "USER_STRUCT_MEMBER", lambda attrs_map: attrs_map.get("NAME") == args.member, nested=True
+    )
+    text = text[:struct_start] + trimmed + text[struct_end:]
+
+    root = parse_xml(text)
+    structs = collect_struct_defs(root)
+    readonly = resolve_member_readonly(root, "auto")
+    rebuilt: list[str] = []
+    kept = 0
+    for var_name in variables_carrying_struct(root, args.struct):
+        text, _, _, carried = rebuild_variable_members_in_text(
+            text, structs, var_name, member_readonly=readonly
+        )
+        rebuilt.append(var_name)
+        kept += carried
+
+    message = (
+        f"RemovedStructMember={args.struct}.{args.member}"
+        f" rebuiltVariables={len(rebuilt)} keptDesc={kept}"
+    )
+    if rebuilt:
+        message += " variables=" + ",".join(rebuilt)
+    if refs:
+        message += f" forcedOverReferences={len(refs)}"
+    return finish_write(args, text, message)
+
+
+def remove_pou(args: argparse.Namespace) -> int:
+    """Delete a whole PROGRAM or FUNCTION_BLOCK, logic included.
+
+    Both store their logic inside themselves -- ST in a `SECTION_LOGIC_ST`
+    `CONTENT` attribute, LD/FBD in a `SECTION_LOGIC_LD` / `SECTION_LOGIC_FBD`
+    child -- so removing the element removes the POU entirely; there is no
+    separate body element to chase (verified: no other element in an observed
+    project carries a POU name).
+    """
+    if not args.name:
+        raise ValueError("--name is required for kind=pou")
+    pou_type = args.pou_type or "program"
+    tag = pou_tag(pou_type)
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    if not any(attr(elem, "NAME") == args.name for elem in root.iter(tag)):
+        raise ValueError(f"{tag} {args.name!r} not found")
+
+    refs = pou_references(text, root, pou_type, args.name)
+    if refs and not args.force:
+        raise ValueError(
+            f"{tag} {args.name!r} is still called in {len(refs)} place(s):\n"
+            + format_references(refs)
+            + "\npass --force to remove it anyway"
+        )
+
+    note = ""
+    if tag == "PROGRAM":
+        parent = {child: elem for elem in root.iter() for child in elem}
+        for program in root.iter("PROGRAM"):
+            if attr(program, "NAME") != args.name:
+                continue
+            task = parent.get(program)
+            if task is not None and task.tag == "EVENT_TASK" and len(task.findall("./PROGRAM")) == 1:
+                note = (
+                    f"WARNING: EVENT_TASK ID={attr(task, 'ID')} now holds no program. "
+                    "An event task holds exactly one, so give it a replacement with "
+                    "add-program or delete the task in the GUI."
+                )
+            break
+
+    new_text = remove_element(text, tag, lambda attrs_map: attrs_map.get("NAME") == args.name)
+    if note:
+        print(note)
+    message = f"Removed=pou:{pou_type}:{args.name}"
+    if refs:
+        message += f" forcedOverReferences={len(refs)}"
+    return finish_write(args, new_text, message)
+
+
+def remove_slave_object(args: argparse.Namespace) -> int:
+    """Delete one CANopen slave object dictionary entry and its mappings."""
+    if not args.port_id or not args.index:
+        raise ValueError("--port-id and --index are required for kind=slave-object")
+    index = parse_object_index(args.index)
+    text = read_text(args.project, args.encoding)
+    port_start, port_end, port_raw, _ = find_nested_element_span(
+        text, "HARDWARE_DEVICE_DOWNLINK_PORT", lambda attrs_map: attrs_map.get("ID") == args.port_id
+    )
+    _, _, object_raw, object_attrs = find_element_span(
+        port_raw, "HARDWARE_CAN_SLAVER_OBJECT", lambda attrs_map: attrs_map.get("INDEX") == index
+    )
+    mapped = [
+        parse_start_tag_attrs(match.group(0)).get("TAG_NAME", "")
+        for match in re.finditer(r"<HARDWARE_MODBUS_TAG_MAPPING\b[^>]*>", object_raw)
+    ]
+    if mapped and not args.force:
+        raise ValueError(
+            f"object 0x{int(index):04X} on port {args.port_id} still maps "
+            f"{len(mapped)} variable(s): {', '.join(mapped)}; "
+            "pass --force to remove the object and its mappings"
+        )
+
+    trimmed = remove_element(
+        port_raw, "HARDWARE_CAN_SLAVER_OBJECT", lambda attrs_map: attrs_map.get("INDEX") == index
+    )
+    new_text = text[:port_start] + trimmed + text[port_end:]
+    print("NOTE: run `validate-slave-objects` -- names, datatypes and the per-port "
+          "binding budget are only checked there, never by the runtime.")
+    message = (
+        f"RemovedSlaveObject=port {args.port_id} index 0x{int(index):04X}"
+        f" desc={object_attrs.get('DESC', '')} mappings={len(mapped)}"
+    )
+    return finish_write(args, new_text, message)
+
+
 def cmd_remove_entity(args: argparse.Namespace) -> int:
+    if args.kind == "user-struct-member":
+        return remove_user_struct_member(args)
+    if args.kind == "pou":
+        return remove_pou(args)
+    if args.kind == "slave-object":
+        return remove_slave_object(args)
+
+    if not args.name:
+        raise ValueError(f"--name is required for kind={args.kind}")
     text = read_text(args.project, args.encoding)
     if args.kind == "variable":
         tag, key = "VARIABLE", args.name
@@ -3635,6 +4086,105 @@ def cmd_remove_entity(args: argparse.Namespace) -> int:
             )
     new_text = remove_element(text, tag, lambda attrs_map: attrs_map.get("NAME") == key)
     return finish_write(args, new_text, f"Removed={args.kind}:{key}")
+
+
+def rename_st_calls(text: str, old: str, new: str) -> tuple[str, int]:
+    """Rename every ST call site of a function block, comments excluded.
+
+    The rename works on the raw `CONTENT` attribute, so the stored line-break
+    style is untouched.  Comments are located on a blanked copy of the same
+    length and left alone: a block named in prose is not a call, and rewriting
+    prose is not this command's job.
+    """
+    call_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(old) + r"(?=\s*\()")
+    total = 0
+
+    def patch_content(match: re.Match[str]) -> str:
+        nonlocal total
+        body = match.group(2)
+        masked = blank_st_comments(body)
+        pieces: list[str] = []
+        last = 0
+        for hit in call_re.finditer(masked):
+            pieces.append(body[last:hit.start()])
+            pieces.append(new)
+            last = hit.end()
+            total += 1
+        pieces.append(body[last:])
+        return match.group(1) + "".join(pieces) + match.group(3)
+
+    patched = re.sub(r'(<SECTION_LOGIC_ST\b[^>]*\bCONTENT=")([^"]*)(")', patch_content, text)
+    return patched, total
+
+
+def cmd_rename_pou(args: argparse.Namespace) -> int:
+    """Rename a POU together with everything that names it.
+
+    A program is named only by its own element -- a task refers to its programs
+    by containment and document order, not by name -- so that rename is a
+    one-attribute edit.  A function block is different: every ST call site
+    spells the block type, and so does a graphical block's `TYPE`, and none of
+    them move with the declaration.
+    """
+    tag = pou_tag(args.pou_type)
+    old, new = args.name, args.new_name
+    if old == new:
+        raise ValueError("--name and --new-name are the same; nothing to do")
+    if args.pou_type == "program":
+        check_identifier_loose(new, "program")
+    else:
+        check_identifier(new, args.pou_type)
+
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    if not any(attr(elem, "NAME") == old for elem in root.iter(tag)):
+        raise ValueError(f"{tag} {old!r} not found")
+    for other_tag in POU_TAGS.values():
+        if any(attr(elem, "NAME") == new for elem in root.iter(other_tag)):
+            raise ValueError(f"a POU named {new!r} already exists ({other_tag})")
+    taken = existing_names(root)
+    if new in taken["variable"]:
+        raise ValueError(f"a VARIABLE named {new!r} already exists")
+    if new in taken["hardware_tag"]:
+        raise ValueError(f"a HARDWARE_CHANNEL_TAG named {new!r} already exists")
+
+    span = find_named_span(text, tag, old)
+    raw = span.raw
+    tag_start, tag_end, _ = find_start_tag_span(raw, tag, lambda attrs_map: attrs_map.get("NAME") == old)
+    raw = raw[:tag_start] + patch_start_tag_attrs(raw[tag_start:tag_end], {"NAME": new}) + raw[tag_end:]
+
+    # A logic section normally carries no NAME; where one does, it repeats the
+    # POU name and has to move with it.
+    sections = 0
+
+    def patch_section(match: re.Match[str]) -> str:
+        nonlocal sections
+        if parse_start_tag_attrs(match.group(0)).get("NAME") != old:
+            return match.group(0)
+        sections += 1
+        return patch_start_tag_attrs(match.group(0), {"NAME": new})
+
+    raw = re.sub(r"<SECTION_LOGIC_\w+\b[^>]*>", patch_section, raw)
+    text = text[:span.start] + raw + text[span.end:]
+
+    calls = blocks = 0
+    if args.pou_type == "function-block":
+        text, calls = rename_st_calls(text, old, new)
+
+        def patch_block(match: re.Match[str]) -> str:
+            nonlocal blocks
+            if parse_start_tag_attrs(match.group(0)).get("TYPE") != old:
+                return match.group(0)
+            blocks += 1
+            return patch_start_tag_attrs(match.group(0), {"TYPE": new})
+
+        text = re.sub(r"<CONTROL_LOGIC_BLOCK\b[^>]*>", patch_block, text)
+
+    return finish_write(
+        args,
+        text,
+        f"RenamedPou={args.pou_type}:{old} -> {new} calls={calls} blocks={blocks} sections={sections}",
+    )
 
 
 # Byte width of each elementary type inside a struct, and the boundary the
@@ -5303,14 +5853,30 @@ def build_parser() -> argparse.ArgumentParser:
                    help="do not carry existing per-element DESC across the rebuild")
     p.set_defaults(func=cmd_rebuild_variable_members)
 
-    p = sub.add_parser("remove", help="delete a VARIABLE or USER_STRUCT")
+    p = sub.add_parser("remove", help="delete a variable, user data type, struct member, POU or CANopen slave object")
     add_common_project_arg(p)
-    p.add_argument("--kind", required=True, choices=["variable", "user-struct"])
-    p.add_argument("--name", required=True)
-    p.add_argument("--force", action="store_true", help="remove a USER_STRUCT even when variables still use it")
+    p.add_argument("--kind", required=True,
+                   choices=["variable", "user-struct", "user-struct-member", "pou", "slave-object"])
+    p.add_argument("--name", help="VARIABLE / USER_STRUCT / POU name")
+    p.add_argument("--struct", help="user data type owning the member, for kind=user-struct-member")
+    p.add_argument("--member", help="member to delete, for kind=user-struct-member")
+    p.add_argument("--pou-type", choices=sorted(POU_TAGS), help="for kind=pou; default program")
+    p.add_argument("--port-id", help="downlink port ID, for kind=slave-object")
+    p.add_argument("--index", help="object index, decimal or 0x-prefixed, for kind=slave-object")
+    p.add_argument("--force", action="store_true",
+                   help="remove even when the project still references the target")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-backup", action="store_true")
     p.set_defaults(func=cmd_remove_entity)
+
+    p = sub.add_parser("rename-pou", help="rename a PROGRAM or FUNCTION_BLOCK together with every call site")
+    add_common_project_arg(p)
+    p.add_argument("--pou-type", required=True, choices=["program", "function-block"])
+    p.add_argument("--name", required=True, help="current POU name")
+    p.add_argument("--new-name", required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(func=cmd_rename_pou)
 
     p = sub.add_parser("struct-layout", help="byte offsets of user data type members, as the GUI computes them")
     add_common_project_arg(p)
