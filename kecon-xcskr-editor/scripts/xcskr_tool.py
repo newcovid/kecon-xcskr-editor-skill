@@ -4376,6 +4376,102 @@ def cmd_validate_datatypes(args: argparse.Namespace) -> int:
     return 1 if (problems and args.strict) else 0
 
 
+def expected_member_descs(
+    name: str,
+    datatype: str,
+    structs: dict[str, list[dict[str, str]]],
+    depth: int = 0,
+) -> list[tuple[str, str, str, str]]:
+    """Descriptions a variable's generated members should carry, and where from.
+
+    Only struct fields appear: their text has a source of truth in the
+    `USER_STRUCT_MEMBER` definition.  An array element has no such source --
+    `rebuild-variable-members` harvests its `DESC` off the old subtree -- so
+    comparing elements against anything would report every hand-written element
+    description as a fault.
+
+    Returns (member name, expected DESC, struct name, field name).
+    """
+    if depth > 8:
+        raise ValueError(f"user data type nesting deeper than 8 levels at {name!r}")
+    out: list[tuple[str, str, str, str]] = []
+    base, count, low = parse_datatype(datatype)
+    if count is not None:
+        for index in range(low, low + count):
+            out.extend(expected_member_descs(f"{name}[{index}]", base, structs, depth + 1))
+    elif base in structs:
+        for field in structs[base]:
+            child = f"{name}.{field['name']}"
+            out.append((child, field["desc"], base, field["name"]))
+            out.extend(expected_member_descs(child, field["datatype"], structs, depth + 1))
+    return out
+
+
+def cmd_validate_desc_drift(args: argparse.Namespace) -> int:
+    """Find members whose type description no longer matches the variable's copy.
+
+    A member exists twice over: once in the `USER_STRUCT_MEMBER` definition and
+    once per variable built on that type, as a generated `VARIABLE_MEMBER`.
+    `set-attrs --kind user-struct-member` writes only the definition, and the
+    variable monitor reads the copy, so a `DESC` edit that is not followed by
+    `rebuild-variable-members` leaves the commissioning engineer looking at the
+    old text.  Nothing else notices: the project parses, compiles and runs, and
+    `validate-datatypes` compares names and datatypes, not descriptions.
+
+    A member whose definition carries no description is skipped, because the
+    generator only falls back to the harvested text when it produces an empty
+    one -- so an empty definition legitimately leaves whatever the variable had.
+    """
+    root = parse_xml(read_text(args.project, args.encoding))
+    structs = collect_struct_defs(root)
+    rows: list[dict[str, object]] = []
+    problems = 0
+    for var in root.iter("VARIABLE"):
+        var_name = attr(var, "NAME")
+        try:
+            expected = expected_member_descs(var_name, attr(var, "DATATYPE"), structs)
+        except ValueError:
+            # A datatype this walk cannot expand is validate-datatypes' business.
+            continue
+        if not expected:
+            continue
+        actual = {attr(member, "NAME"): attr(member, "DESC") for member in var.iter("VARIABLE_MEMBER")}
+        for member_name, type_desc, struct_name, field_name in expected:
+            if not type_desc:
+                continue
+            if member_name not in actual:
+                # A missing member is a member tree fault, reported by
+                # validate-datatypes; reporting it here too is only noise.
+                continue
+            drifted = actual[member_name] != type_desc
+            if drifted:
+                problems += 1
+            elif not args.show_all:
+                continue
+            rows.append(
+                {
+                    "struct": struct_name,
+                    "member": field_name,
+                    "variable": var_name,
+                    "path": member_name,
+                    "status": "DESC_DRIFT" if drifted else "OK",
+                    "type_desc": type_desc,
+                    "variable_desc": actual[member_name],
+                }
+            )
+    output_rows(
+        rows,
+        ["struct", "member", "variable", "path", "status", "type_desc", "variable_desc"],
+        args.format,
+        args.output,
+        args.output_encoding,
+    )
+    if problems:
+        print("Fix: rebuild-variable-members --name <variable> for each variable listed")
+    print(f"Problems={problems}")
+    return 1 if (problems and args.strict) else 0
+
+
 DESC_MAX_CHARS = 128
 
 
@@ -5891,6 +5987,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true", help="exit non-zero when problems are found")
     p.add_argument("--show-all", action="store_true", help="print every checked row, not only problems")
     p.set_defaults(func=cmd_validate_datatypes)
+
+    p = sub.add_parser(
+        "validate-desc-drift",
+        help="check every generated VARIABLE_MEMBER DESC still matches its user data type",
+    )
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.add_argument("--strict", action="store_true", help="exit non-zero when problems are found")
+    p.add_argument("--show-all", action="store_true", help="print every compared member, not only the drifted ones")
+    p.set_defaults(func=cmd_validate_desc_drift)
 
     p = sub.add_parser("validate-desc-length", help="check every DESC fits the GUI description length limit")
     add_common_project_arg(p)

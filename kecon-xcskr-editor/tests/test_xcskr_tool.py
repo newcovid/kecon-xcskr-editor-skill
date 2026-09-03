@@ -1695,6 +1695,62 @@ class XcskrToolTests(unittest.TestCase):
             self.assertIn("OverBytes=1", result.stdout)
             self.assertIn("OVER_BYTES", result.stdout)
 
+    def test_desc_drift_is_clean_on_a_freshly_generated_member_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.project_with_wheel_struct(Path(temp))
+
+            result = run_tool("validate-desc-drift", "--project", str(project), "--strict")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Problems=0", result.stdout)
+
+    def test_desc_drift_reports_a_member_desc_changed_without_a_rebuild(self) -> None:
+        """The whole point: the type moved on and the variables did not.
+
+        `set-attrs --kind user-struct-member` writes only the definition. The
+        variable monitor reads the generated copy, so until every variable of
+        that type is rebuilt an engineer sees the old text, and nothing else in
+        the toolchain notices -- the project parses, compiles and runs.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.project_with_wheel_struct(Path(temp))
+            run_tool("set-attrs", "--project", str(project), "--kind", "user-struct-member",
+                     "--struct", "WheelData", "--member", "Angle",
+                     "--attr", "DESC=steering angle", "--no-backup")
+
+            drift = run_tool("validate-desc-drift", "--project", str(project), "--strict", check=False)
+
+            self.assertEqual(drift.returncode, 1)
+            # Four array elements plus the copy nested inside MachineData.
+            self.assertIn("Problems=5", drift.stdout)
+            self.assertIn("DESC_DRIFT", drift.stdout)
+            self.assertIn("Wheel[0].Angle", drift.stdout)
+            self.assertIn("Mach.Axis.Angle", drift.stdout)
+            self.assertIn("steering angle", drift.stdout)
+            self.assertIn("rebuild-variable-members", drift.stdout)
+
+            run_tool("rebuild-variable-members", "--project", str(project), "--name", "Wheel", "--no-backup")
+            run_tool("rebuild-variable-members", "--project", str(project), "--name", "Mach", "--no-backup")
+            fixed = run_tool("validate-desc-drift", "--project", str(project), "--strict")
+            self.assertIn("Problems=0", fixed.stdout)
+
+    def test_desc_drift_ignores_per_element_descriptions(self) -> None:
+        """An array element has no source of truth, so it cannot have drifted.
+
+        Its description lives only on the variable -- the struct definition has
+        nowhere to record it -- and comparing elements against anything would
+        report every hand-written element description as a fault.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.project_with_wheel_struct(Path(temp))
+            self.set_element_desc(project, "Wheel[2]", "third wheel")
+            self.set_element_desc(project, "Wheel[0].Spare[1]", "spare bit 1")
+
+            result = run_tool("validate-desc-drift", "--project", str(project), "--strict")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Problems=0", result.stdout)
+
     # ------------------------------------------------------------------
     # Deleting and renaming: struct members, POUs, CANopen slave objects.
     # Every one of these has to prove three things -- it removes what was

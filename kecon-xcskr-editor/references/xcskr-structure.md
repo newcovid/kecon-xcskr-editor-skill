@@ -2,29 +2,40 @@
 
 ## Contents
 
-- Encoding and raw ST handling
-- Control scheme and tasks
-- POU and ST logic
-- Graphical logic: LD and FBD
-- Variables and user data types
-- Hardware configuration and hardware variables
+- Encoding And Raw ST Handling
+- Control Scheme And Tasks
+- POU And ST Logic
+- Graphical Logic: LD And FBD
+- Variables And User Data Types
 - A DESC longer than the GUI limit can only be written by a tool
 - Member offsets are computed, not stored -- BOOL takes a byte and members are aligned
 - Array members of a user data type are written expanded
-- Vendor reference resources, and why none of their paths are hard-coded
+- Removing one member of a user data type
+- Changing one member's DESC
+- Hardware Configuration And Hardware Variables
+- A scratch variable shared by two tasks is worse than the tear it was added to fix
+- Downlink port settings live in child elements, not on the port tag
+- A Modbus TCP server exposes variables through named mapping windows
 - Modbus RTU master commands live in the hardware tree, not in ST
 - Command group direction and send mode
+- Vendor reference resources, and why none of their paths are hard-coded
 - The vendor function block library is the authority on pin order
 - Function block call argument order
-- Changing a command group between input and output
-- CANopen slave object dictionary
-- The debug watch list is not in the project file, but a GUI save still changes it
-- Safe write model
-- Verification checklist
+- Changing a command group between 输入命令 and 输出命令
+- CANopen Slave Object Dictionary
+- The debug watch list is not in the project file -- but a GUI save still changes it
+- Array elements carry their own DESC
+- Safe Write Model
+- Verification Checklist
+- Controller configuration and the configuration wizard
+- CANopen node ids are stored twice
+- Enabling and disabling a CANopen object
+- Renaming a hardware variable
 
-Facts marked *verified* were cross-checked against the official Kecon sample
-projects shipped with the xRobotDesigner help material, not inferred from a
-single project.
+Facts marked *verified* each say how they were established -- compared against an
+official Kecon sample project, watched in the GUI, reproduced on a production
+project, or accepted or refused by the compiler. Judge a claim by the method it
+names; anything without such a note is inference and is labelled as unverified.
 
 ## Encoding And Raw ST Handling
 
@@ -413,6 +424,38 @@ type never appears in code by its own name; it reaches ST, graphical pin
 bindings and mapping tables only through the variables declared with it. The
 subscript has to stay a wildcard: real code indexes with a loop counter, so
 enumerating literal indexes finds nothing.
+
+## Changing one member's DESC
+
+The same "twice over" shape bites on edits, not just deletions.
+`set-attrs --kind user-struct-member` rewrites only the `USER_STRUCT_MEMBER`
+definition. Every variable built on that type keeps its own generated
+`VARIABLE_MEMBER` carrying a stale copy of the old `DESC`, and that copy is what
+the variable monitor shows an engineer mid-commissioning. The project parses,
+compiles and runs either way, and `validate-datatypes` is about datatypes, not
+descriptions; `validate-desc-drift` is the check that reports the divergence.
+
+Follow every member `DESC` change with `rebuild-variable-members --name <var>`
+for each variable of that type. A struct field's `DESC` always comes from the
+type definition and overwrites whatever the `VARIABLE_MEMBER` held -- the type is
+the source of truth, so a hand-edited instance description is lost by design.
+Per-element array descriptions have no such source, so they are harvested from
+the old subtree and put back. One consequence: clearing a member's `DESC` to
+empty does *not* clear the variable's copy, because an empty generated
+description is exactly what triggers the harvest. *Read out of the generator in
+`render_variable_member`, not measured on a running project: the empty-DESC
+consequence follows from the code, it has not been reproduced in the GUI.*
+
+`keptDesc=N` counts the members that carried a description before the rebuild
+and still exist in the regenerated tree. It includes struct fields whose text
+came from the type definition, so read it as a rough completeness check, not as
+the number of per-element descriptions preserved.
+
+*Verified on 5.1.0, on a production project:* rewriting one member's `DESC` with
+`set-attrs --kind user-struct-member` left that variable's generated
+`VARIABLE_MEMBER` still carrying the old text; `rebuild-variable-members` on the
+variable then reported `members=88 keptDesc=84`, and the member carried the new
+text while the array elements kept theirs.
 
 ## Hardware Configuration And Hardware Variables
 
@@ -1343,9 +1386,12 @@ only shows as a blank column in the monitor much later. Adding one struct member
 months afterward is enough to force such a rebuild. The command therefore
 harvests the existing `NAME` -> `DESC` map from the variable's current subtree
 first and puts it back wherever the regenerated node has no description of its
-own, and it reports how many it carried as `keptDesc=N`. A struct field's
-description still comes from the struct definition, which is its source of
-truth; only elements, which have no such source, fall back to the harvest.
+own. A struct field's description still comes from the struct definition, which
+is its source of truth; only elements, which have no such source, fall back to
+the harvest. The reported `keptDesc=N` counts every member that had a
+description beforehand and survives into the new tree, struct fields whose text
+came from the type definition included, so it is a rough completeness check
+rather than the exact number of element descriptions carried across.
 `--drop-element-desc` opts out. *Verified on 5.1.0: rebuilding three
 variables on a project with 1945 described elements kept all of them.*
 

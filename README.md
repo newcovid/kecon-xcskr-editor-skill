@@ -1,6 +1,6 @@
 # Kecon xRobotDesigner `.xcskr` Editor Skill
 
-一个面向 Codex 的非官方 Skill，用于检查、摘要、导出和安全修改科聪
+一个面向 Claude Code / Codex 的非官方 Skill，用于检查、摘要、导出和安全修改科聪
 xRobotDesigner `.xcskr` PLC 工程。
 
 ## 功能
@@ -21,7 +21,9 @@ xRobotDesigner `.xcskr` PLC 工程。
   `rebuild-variable-members` 重建，`validate-datatypes` 递归查成员树漂移。
 - 图形逻辑：引脚绑定变量、两引脚连线、拆线、从参考工程复制功能块。
 - 替换 ST，保留该 POU 或工程原有的换行编码风格。
-- 定点修改变量、POU、硬件标签、CAN/CANopen 对象和映射属性。
+- 定点修改变量、POU、硬件标签、CAN/CANopen 对象和映射属性。改结构体成员的 DESC 只动类型
+  那一份，每个变量还留着一份旧文本，必须跟一次 `rebuild-variable-members`；工程照样编译运行，
+  没有任何东西会报，`validate-desc-drift` 专抓这个。
 - 重命名硬件标签时，同时移动它的 `VARIABLE_MEMBER` 成员树和命令组引用——ST 引用的是成员。
 - 重命名 POU（`rename-pou`）：程序只改自己的标识；功能块连 ST 调用点和图形块 `TYPE` 一起改。
 - 删除 POU、结构体成员、CANopen 从站对象（`remove --kind pou / user-struct-member / slave-object`）：
@@ -49,6 +51,7 @@ xRobotDesigner `.xcskr` PLC 工程。
 | `validate-array-index` | 位串当数组下标 |
 | `validate-comment-balance` | 没闭合的 `(*` 把后面整段代码吃掉，编译不报错 |
 | `validate-modbus-mapping` | 映射窗口里标签宽度与地址空间对不上，编译只报窗口名不报标签 |
+| `validate-desc-drift` | 改了结构体成员的 DESC 却没重建变量成员树，监控里还显示旧文本 |
 | `validate-controller-support` | 用了本型号控制器不支持的功能 |
 
 ### 写入保真
@@ -57,8 +60,8 @@ xRobotDesigner `.xcskr` PLC 工程。
 缩进步长从目标文件读取。对官方样例工程做“解绑再绑回”“拆线再接回”的往返测试，
 结果与原件逐字节一致。
 
-XML 结构约定不是从单个工程猜的，而是与 xRobotDesigner 随附的官方示例工程逐项核对过，
-详见 [`references/xcskr-structure.md`](kecon-xcskr-editor/references/xcskr-structure.md)
+XML 结构约定每条都记着它的来源：与官方示例工程逐项核对、GUI 实测、生产工程复现，
+或者看编译器收不收。请按每条注明的方式判断可信度，没标的就是推断。详见 [`references/xcskr-structure.md`](kecon-xcskr-editor/references/xcskr-structure.md)
 和 [`references/ld-fbd-st.md`](kecon-xcskr-editor/references/ld-fbd-st.md)。
 
 ## 文本工作区：在 GUI 之外编辑

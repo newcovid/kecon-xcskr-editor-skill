@@ -1,6 +1,6 @@
 ---
 name: kecon-xcskr-editor
-description: Use when Codex needs to inspect, summarize, export, or safely modify generic Kecon/xRobotDesigner .xcskr PLC projects, including hardware configuration, variables, user data types, function blocks, LD/FBD graphical logic, control-scheme tasks, ST code, CAN/CANopen, Modbus, and GBK XML.
+description: This skill should be used when working with Kecon / xRobotDesigner .xcskr PLC projects - reading or summarising one, adding variables, user data types, programs or function blocks, editing hardware config and CANopen/Modbus command groups, wiring LD/FBD pins, replacing ST code, or round-tripping the project through a plain-text workspace. Triggers on ".xcskr", "科聪工程", "xRobotDesigner", "PLC 工程加变量", "导出成文本再回灌", "CANopen 从站对象".
 ---
 
 # Kecon xRobotDesigner `.xcskr` Editor
@@ -93,6 +93,11 @@ python ... set-attrs --project P --kind pou --pou-type function-block --name "FB
 python ... set-attrs --project P --kind block --name "底盘控制" --block "_MODULE0" --attr "DESC=chassis solver"
 ```
 
+The `user-struct-member` line above is only half the edit: a member `DESC`
+change has to be followed by `rebuild-variable-members` on every variable of that
+type, or the variable monitor keeps showing the old text. See "User data types
+and variables" below, and `validate-desc-drift` under "Static checks".
+
 Supported `set-attrs --kind`: `variable`, `hardware-tag`, `user-struct`, `user-struct-member`, `pou`, `pou-var`, `task`, `trig-condition`, `block`, `downlink-port`, `station`, `slave-object`, `slave-mapping`.
 
 Tasks:
@@ -161,6 +166,15 @@ python ... validate-datatypes --project P --strict
 whole `VARIABLE_MEMBER` tree for arrays and structs, and refuses names that collide with an
 existing variable or hardware tag. After changing a struct, every variable that uses it needs
 `rebuild-variable-members`; `validate-datatypes` finds the ones that drifted.
+
+That applies to a plain `DESC` edit too, and nothing reports it. `set-attrs
+--kind user-struct-member` touches only the type; each variable of that type keeps a
+generated `VARIABLE_MEMBER` holding the old text, and that stale copy is what the
+variable monitor shows. Run `rebuild-variable-members --name <var>` after every member
+`DESC` change; `validate-desc-drift` reports the ones still out of step. The rebuild
+takes each struct field's text from the type definition, so a hand-edited instance
+description is lost by design; only per-element array descriptions, which have no
+such source, are harvested and put back.
 
 `remove --kind user-struct-member` does both halves itself: it deletes the member
 from the type and rebuilds every variable built on that type -- directly, through
@@ -232,10 +246,13 @@ python ... validate-controller-support --project P
 python ... validate-st-format --project P --strict
 python ... validate-datatypes --project P --strict
 python ... validate-canopen-command-ids --project P    # duplicates AND enabled-without-id
+python ... alloc-canopen-command-ids --project P       # hands out the ids the GUI would have
+python ... validate-slave-objects --project P          # name, DATATYPE and per-port limits
 python ... validate-hardware-bindings --project P
 python ... validate-command-directions --project P
 python ... validate-fb-calls --project P
 python ... validate-desc-length --project P --strict   # only a tool can write an over-long DESC
+python ... validate-desc-drift --project P --strict    # member DESC changed, variables not rebuilt
 python ... validate-array-index --project P            # a bit string cannot subscript an array
 python ... rebuild-user-struct-members --project P
 python ... struct-layout --project P --struct S
@@ -330,11 +347,14 @@ Four refusals carry the design, and none of them should be worked around:
 
 `import-workspace` applies every change to one in-memory string, parses once and
 writes once, so a failure part-way leaves the project untouched. An unchanged
-round trip is byte-identical (verified against the 5.2 MB IVC300 project).
+round trip is byte-identical (verified against a 5.2 MB production project).
 
 `check-workspace` prints `file:line:col: severity: message`, which an editor's
 problem panel can parse into clickable entries. Only `validate-fb-calls` can
 name a line; the project-wide validators are reported as a pass/fail summary.
+`--align-script` is optional and this skill does not ship one: point it at the
+project's own ST comment alignment script if it has one, and leave it out
+otherwise -- the alignment check is then skipped and the rest still runs.
 
 ## Structure Notes
 
@@ -352,16 +372,36 @@ name a line; the project-wide validators are reported as a pass/fail summary.
 - An XML parser turns a *literal* line break inside an attribute value into a space, so a POU stored with literal LF reads back through ElementTree as one line and a line number counted on it is always 1. Count on the raw attribute text instead; `st_raw_line_number` does.
 - A POU is self-contained: nothing outside its own element names a program, so deleting or renaming one touches one element. A function block is the opposite -- every ST call and every graphical block `TYPE` spells its name and has to move with it.
 
-Read `references/xcskr-structure.md` before changing hardware, task, variable, POU, graphical, or CAN/CANopen structures. Read `references/ld-fbd-st.md` when deciding between ST and a graphical language, or when explaining the difference.
+Read `references/xcskr-structure.md` before changing hardware, task, variable, POU, graphical, or CAN/CANopen structures. Read `references/ld-fbd-st.md` when deciding between ST and a graphical language, or when explaining the difference. `references/kecon-help-kb.md` is the curated vendor knowledge base `kecon_help.py search` reads alongside the CHM index.
 
 ## Guardrails
 
+### Files and writing
+
 - Do not full-document reserialize `.xcskr` with ElementTree. It can flatten ST formatting.
+- Verify a `set-attrs` write by reading the target attribute back. The command reports the selector it resolved, not the attribute it changed, so a selector that lands on an ancestor element succeeds loudly and changes nothing that matters (see the station note above).
+- Do not write to the `CONNECTION_PIN` attribute; it is empty in every observed project and carries no binding.
+- Do not synthesize a new graphical block: a block `TYPE` implies a fixed pin list the file does not describe. Copy one from a reference project with `copy-block`.
+- Exported `.st` files are CRLF, always. The GUI stores each POU's line breaks in its own style (literal LF / `&#10;` / `&#x0D;&#x0A;`, current versions write the third), so exporting verbatim gives a mixture and every GUI edit flips one more file into a whole-file diff (verified: a 3-line comment change arrived as 1599 changed lines). `export-workspace` normalizes; `import-workspace` still writes each element back in its own style, so the project file never churns. Point the editor's `files.eol` at CRLF for `.st` so hand edits do not flip it back.
+- Fill in per-element descriptions. An array member nests one `VARIABLE_MEMBER` per element, each with its own `DESC`, and that is what the variable monitor shows beside `Name[57]`; without it an engineer has to go back to a lookup table mid-commissioning. Fill them by rewriting one element's `DESC` attribute in place -- never by round-tripping the document through ElementTree, which reformats the whole file. `rebuild-variable-members` harvests them and puts them back, so the order of that work no longer matters -- its `keptDesc=N` is a rough completeness count over all members that had a description, not the element total. *Verified on 5.1.0.*
+- Keep every `DESC` inside the GUI's description length limit (`描述长度超过%d个字符的限制！`; **128** observed on 5.1.0). The XML accepts any length, so an over-long description written by a tool loads, compiles and runs -- and then silently blocks whoever next opens that field in the GUI from saving the dialog at all. `validate-desc-length` reports it; `check-workspace` runs it. Whether the limit counts characters or GBK bytes is unverified, so stay inside it both ways: a Chinese description costs two bytes per character.
+- Preserve the self-closing style an element already uses (verified). V5.1.1.9998-C writes `"/>` and the V5.0 sample projects write `" />`; both parse identically, but rewriting one as the other puts a spurious line in every diff and stops an unchanged round trip from being byte-identical. `replace_section_logic_raw` now keeps whichever the element had.
+- Do not expect a bare `>` inside `SECTION_LOGIC_ST CONTENT`. Counted across two production projects (IVC300 and IVC200 controllers) and the official GUI-authored sample: 845 occurrences of `&gt;` and zero bare `>`. Writing a bare `>` parses, but it is not what the GUI produces.
+
+### ST and tasks
+
 - A variable bound into the object dictionary is read asynchronously by the
   master and must be assigned **once per scan**. Building a status word with
   `X := 0` then a series of `X := X + n` publishes every partial sum; the master
   sees `0`, `1`, `3` against a nominal `0x83`, with nothing logged anywhere.
   Pack into a scratch variable and write the result once.
+- Keep an ST function block call's argument list in declaration order. Named arguments do not make order optional (verified): `add-pou-var` appends, so a call that lists new pins in the middle raises one `FBDError` id=769 per call site, with no line number and FBD wording about updating the block instance.
+- One scratch variable, one task. Task priority is startup > event > cycle > main and a higher task **preempts** a lower one mid-scan, so a scratch shared across tasks voids the write-once fix it was added for -- and does worse: preemption between `X := 0` and `target := X` latches the other task's value into the target until the next scan, where a torn read would have self-corrected (verified). Shared `FOR` counters are the same trap: the lower-priority loop exits early and leaves an initialisation array half-filled with the done-flag still set. Nothing in the file marks a variable task-local and the compiler stays silent.
+- Subscript arrays with an integer only. `BOOL`, `BYTE`, `WORD`, `DWORD` and `LWORD` are bit strings in IEC 61131-3, not numbers, and the compiler refuses one as a subscript with `文本"["错误，数组的索引值不是整数` plus a follow-on `匹配变量表达式失败` on the same statement. `BYTE` is the tempting type for a small counter such as a ring buffer write pointer, and nothing else complains -- a `BYTE` compares against an integer happily -- so only subscripting exposes it. Copy the value into a plain integer variable and subscript with that. An integer-typed member of a user structure is fine as a subscript directly (`Table[Status.Index]` with an `INT` member compiles; verified on 5.1.0), so the copy is only needed for bit-string types -- an array element used as a subscript remains unverified. `validate-array-index` reports the bit-string case; `check-workspace` runs it. *Verified on 5.1.0.*
+- Write `ELSEIF`, not `ELSIF`. The dialect rejects the IEC 61131-3 spelling at compile time (`不允许使用ELSIF`) and accepts only `ELSEIF`; the same source with the keyword swapped compiles (verified on 5.1.0). Neither official sample uses either spelling, so nothing else warns.
+
+### CANopen and Modbus
+
 - Re-importing an EDS rebuilds a node's command groups: `EDTYPE` is reset to
   output and tags are renamed after the EDS object names. An input command left
   as output makes the master overwrite the slave's data with zeros every cycle,
@@ -380,28 +420,21 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
   must match the GUI dropdown (`boolean`, not `bool`), and a port carries at
   most 63 bound variables. Nothing warns; the controller simply builds no
   dictionary. Run `validate-slave-objects` after every such edit.
-- Verify a `set-attrs` write by reading the target attribute back. The command reports the selector it resolved, not the attribute it changed, so a selector that lands on an ancestor element succeeds loudly and changes nothing that matters (see the station note above).
 - Do not infer physical CAN ports from XML `NAME` alone; compare `ID`, `DISPLAY`, `PHYSICAL_ID`, and exported hardware context.
 - Do not disable hardware tags, command groups, or mappings merely to silence a static warning.
-- Do not write to the `CONNECTION_PIN` attribute; it is empty in every observed project and carries no binding.
-- Do not synthesize a new graphical block: a block `TYPE` implies a fixed pin list the file does not describe. Copy one from a reference project with `copy-block`.
 - Interpret CANopen PDO direction from the slave perspective: RPDO/Receive means the slave receives data; TPDO/Transmit means the slave sends data.
 - Do not read `CMD_ACCESS_TYPE` as a direction. Direction is `EDTYPE` (1=input/read, 0 or absent=output/write); send mode is `MODE` (0=周期, 1=变化发布, 2=初始化执行, 3=变化加周期). Both are verified against the GUI. An `rw` object may well be an output you are only pretending to read.
 - A command on `MODE="1"` fires on value change, so a program that writes a command signature must clear the buffer afterwards or the same command never repeats. A command on `MODE="0"` is resent every cycle, which for an EEPROM-backed object such as `1010:01` is device wear rather than a one-shot.
-- Keep an ST function block call's argument list in declaration order. Named arguments do not make order optional (verified): `add-pou-var` appends, so a call that lists new pins in the middle raises one `FBDError` id=769 per call site, with no line number and FBD wording about updating the block instance.
-- Run `validate-controller-support` before handing a project back for compilation: the chassis driver type, the CANopen command budget and the task limits are vendor-table constraints that no amount of XML tidiness will satisfy.
-- Exported `.st` files are CRLF, always. The GUI stores each POU's line breaks in its own style (literal LF / `&#10;` / `&#x0D;&#x0A;`, current versions write the third), so exporting verbatim gives a mixture and every GUI edit flips one more file into a whole-file diff (verified: a 3-line comment change arrived as 1599 changed lines). `export-workspace` normalizes; `import-workspace` still writes each element back in its own style, so the project file never churns. Point the editor's `files.eol` at CRLF for `.st` so hand edits do not flip it back.
-- One scratch variable, one task. Task priority is startup > event > cycle > main and a higher task **preempts** a lower one mid-scan, so a scratch shared across tasks voids the write-once fix it was added for -- and does worse: preemption between `X := 0` and `target := X` latches the other task's value into the target until the next scan, where a torn read would have self-corrected (verified). Shared `FOR` counters are the same trap: the lower-priority loop exits early and leaves an initialisation array half-filled with the done-flag still set. Nothing in the file marks a variable task-local and the compiler stays silent.
-- Subscript arrays with an integer only. `BOOL`, `BYTE`, `WORD`, `DWORD` and `LWORD` are bit strings in IEC 61131-3, not numbers, and the compiler refuses one as a subscript with `文本"["错误，数组的索引值不是整数` plus a follow-on `匹配变量表达式失败` on the same statement. `BYTE` is the tempting type for a small counter such as a ring buffer write pointer, and nothing else complains -- a `BYTE` compares against an integer happily -- so only subscripting exposes it. Copy the value into a plain integer variable and subscript with that. An integer-typed member of a user structure is fine as a subscript directly (`Table[Status.Index]` with an `INT` member compiles; verified on 5.1.0), so the copy is only needed for bit-string types -- an array element used as a subscript remains unverified. `validate-array-index` reports the bit-string case; `check-workspace` runs it. *Verified on 5.1.0.*
 - Set a Modbus RTU master command's poll period, function code, first register or register count with `set-attrs --kind com-cmd --cmd-id <ID> --attr COM_CMD_START_ADDR=<n>`, one property per call. Like a port's baud rate, these live in `HARDWARE_PROPERTY` children; written onto the `HARDWARE_COM_CMD` start tag they are accepted everywhere and the command keeps polling its old register. Remember the first register is one-based -- see `references/xcskr-structure.md`.
-- Fill in per-element descriptions. An array member nests one `VARIABLE_MEMBER` per element, each with its own `DESC`, and that is what the variable monitor shows beside `Name[57]`; without it an engineer has to go back to a lookup table mid-commissioning. Fill them by rewriting one element's `DESC` attribute in place -- never by round-tripping the document through ElementTree, which reformats the whole file. `rebuild-variable-members` preserves them (reporting `keptDesc=N`), so the order of that work no longer matters. *Verified on 5.1.0.*
-- Keep every `DESC` inside the GUI's description length limit (`描述长度超过%d个字符的限制！`; **128** observed on 5.1.0). The XML accepts any length, so an over-long description written by a tool loads, compiles and runs -- and then silently blocks whoever next opens that field in the GUI from saving the dialog at all. `validate-desc-length` reports it; `check-workspace` runs it. Whether the limit counts characters or GBK bytes is unverified, so stay inside it both ways: a Chinese description costs two bytes per character.
-- Write `ELSEIF`, not `ELSIF`. The dialect rejects the IEC 61131-3 spelling at compile time (`不允许使用ELSIF`) and accepts only `ELSEIF`; the same source with the keyword swapped compiles (verified on 5.1.0). Neither official sample uses either spelling, so nothing else warns.
 - Disabling a PDO channel in the GUI writes three things: the channel tag `ENABLE="NO"`, the group `HARDWARE_GROUP_ENABLE="NO"`, and command id `0` on the nested `HARDWARE_CAN_CMD` (verified by ticking and unticking a driver station's RPDO in the GUI and diffing). A tag left `ENABLE="YES"` under a disabled group is therefore a tool-made leftover, not a GUI shape; harmless, but bring it back to the GUI shape when you touch it. Run `validate-command-directions` after every GUI session: a PDO group ticked for a look and never unticked becomes an output the master sends as constant zeros every cycle.
 - Enabling a CANopen object takes **three** writes, not two: the channel tag's `ENABLE`, the group's `HARDWARE_GROUP_ENABLE`, and a **command id** on `HARDWARE_CAN_CMD@ID`. The GUI hands out the id when you tick the group; `set-attrs --kind cmd-group` does not, so always follow it with `alloc-canopen-command-ids`. Skipping the id costs a build with no clue in it: the compiler blames every program that uses the tag with `文本"<tag>"错误，字符串无法识别` on 第1行, and nothing mentions the command group (verified: 27 such groups -> 216 errors). Only uniqueness is required; see references/xcskr-structure.md for the numbering the GUI itself uses.
+- A Modbus RTU slave has no `CommFailed` tag -- only CANopen slaves get one. Judge an RTU link from its payload (a field that cannot legitimately be zero, plus whether the block changes at all within a timeout), and do not assume the runtime zeroes a stale channel tag; that behaviour is unverified.
+
+### Working alongside the GUI
+
+- Run `validate-controller-support` before handing a project back for compilation: the chassis driver type, the CANopen command budget and the task limits are vendor-table constraints that no amount of XML tidiness will satisfy.
 - Use xRobotDesigner GUI compile/download as the final authority. Static XML checks only prove that the edited file is structurally sane enough to hand back for GUI validation.
 - Close xRobotDesigner before writing to a project from here. The GUI holds its own in-memory copy and a single save overwrites the whole file, so a CLI edit made while the project is open is lost without any error. An ordinary text editor such as VSCode holds no exclusive lock and does not need to be closed.
-- A Modbus RTU slave has no `CommFailed` tag -- only CANopen slaves get one. Judge an RTU link from its payload (a field that cannot legitimately be zero, plus whether the block changes at all within a timeout), and do not assume the runtime zeroes a stale channel tag; that behaviour is unverified.
 - The debug watch list is **not** stored in the `.xcskr` (verified:
   no monitor / watch / force / trace element or attribute in two production
   projects or in either official sample; the byte string `DebugVar` appears zero
@@ -413,5 +446,3 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
   save, logic change or not: `PROJECT@VERSION` is a save counter that only the
   GUI writes. After the GUI has had a project, re-export the workspace rather
   than looking for what moved.
-- Preserve the self-closing style an element already uses (verified). V5.1.1.9998-C writes `"/>` and the V5.0 sample projects write `" />`; both parse identically, but rewriting one as the other puts a spurious line in every diff and stops an unchanged round trip from being byte-identical. `replace_section_logic_raw` now keeps whichever the element had.
-- Do not expect a bare `>` inside `SECTION_LOGIC_ST CONTENT`. Counted across the IVC300 project, its IVC200 sibling and the official GUI-authored sample: 845 occurrences of `&gt;` and zero bare `>`. Writing a bare `>` parses, but it is not what the GUI produces.

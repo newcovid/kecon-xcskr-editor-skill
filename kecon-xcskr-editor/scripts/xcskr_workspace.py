@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Explode a Kecon `.xcskr` project into an editable text workspace and fold it back.
 
 The GUI editor cannot change its font, size or theme, so the practical way to
@@ -1061,6 +1061,7 @@ PROJECT_VALIDATORS = [
     ("validate-canopen-command-ids", []),
     ("validate-controller-support", []),
     ("validate-desc-length", ["--strict"]),
+    ("validate-desc-drift", ["--strict"]),
     ("validate-array-index", []),
     ("validate-modbus-mapping", []),
     ("validate-comment-balance", []),
