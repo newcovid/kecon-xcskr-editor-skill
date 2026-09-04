@@ -26,9 +26,12 @@ xRobotDesigner `.xcskr` PLC 工程。
   没有任何东西会报，`validate-desc-drift` 专抓这个。
 - 重命名硬件标签时，同时移动它的 `VARIABLE_MEMBER` 成员树和命令组引用——ST 引用的是成员。
 - 重命名 POU（`rename-pou`）：程序只改自己的标识；功能块连 ST 调用点和图形块 `TYPE` 一起改。
-- 删除 POU、结构体成员、CANopen 从站对象（`remove --kind pou / user-struct-member / slave-object`）：
+- 删除 POU、结构体成员、功能块引脚、CANopen 从站对象
+  （`remove --kind pou / user-struct-member / pou-var / slave-object`）：
   先扫 ST、图形绑定、Modbus 映射、命令组里的引用，有引用就拒绝，`--force` 才放行；
   删结构体成员会顺手重建承载它的变量成员树并保留逐元素 DESC。
+  删功能块引脚只动声明，块自己的 ST 与每个调用点是另一轮文本改动，拒绝时列出的
+  那张单子就是那一轮的清单。
 - 给启用的 CANopen 命令组补发命令号。GUI 勾选时会自动发号，直接改 XML 不会；
   少了号编译器不报命令组，而是报引用该标签的**程序**「字符串无法识别」并算在第 1 行。
 - 创建时间戳备份。

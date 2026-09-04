@@ -129,6 +129,8 @@ python ... add-pou-var --project P --name AlarmLatch --var-section input --var "
 python ... rename-pou --project P --pou-type function-block --name AlarmLatch --new-name Latch
 python ... rename-pou --project P --pou-type program --name "旧程序名" --new-name "新程序名"
 python ... remove --project P --kind pou --pou-type function-block --name Latch
+python ... remove --project P --kind pou-var --pou-type function-block --name RAMP `
+    --var-section output --var AtTarget
 python ... remove --project P --kind pou --pou-type program --name "旧程序名"
 ```
 
@@ -140,6 +142,32 @@ logic in one element, and refuses while a function block is still called --
 `--force` overrides but does not touch the calling code. Deleting the one
 program of an event task is allowed and warned about, since an event task holds
 exactly one.
+
+**Changing a function block's pins.** A pin exists in three places and no one
+command reaches all three: the `SECTION_VAR_*` declaration, the assignments and
+reads inside the block's own ST, and the named argument at every call site --
+plus every graphical block of that type, whose pins are drawn by name.
+`add-pou-var` appends one and `remove --kind pou-var` deletes one; both touch the
+declaration only. `remove --kind pou-var` refuses while any of the three still
+names the pin and prints them with line numbers, which is the checklist for the
+ST pass; `--force` overrides and leaves the code alone.
+
+Order the work configuration first, then ST, and expect one window where the
+project does not compile:
+
+1. `remove --kind pou-var --force` (or `add-pou-var`) on the `.xcskr`.
+2. `export-workspace`. The exported ST still names the old pin.
+3. Edit the block body and every call site in the workspace.
+4. `import-workspace`.
+
+Inside that window `check-workspace` reports one `pin not declared: <pin>` per
+call site, from `validate-fb-calls`. That is the expected state, and it falling
+silent is how you know step 3 is complete (*verified*: removing an output pin
+from a project function block with three ST call sites -- the checker named all
+three and went quiet once the calls were edited). Whether the GUI accepts a pin
+list edited this way is **not verified**; compile once in xRobotDesigner before
+downloading. Do not open the GUI before step 4 -- it would save the half-edited
+project back over the file.
 
 Programs execute in the document order of their task, so `--after` / `--before` /
 `--index` are functional, not cosmetic; `move-program` is how a safety stage gets

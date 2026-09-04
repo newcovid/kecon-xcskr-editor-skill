@@ -1386,6 +1386,7 @@ def project_function_block_pins(root: ET.Element) -> dict[str, tuple[list[str], 
 
 
 ST_CALL_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\s*\(([^;]*?)\)\s*;", re.S)
+XML_ENTITY_RE = re.compile(r"&(?:#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
 ST_CALL_SKIP = {"IF", "FOR", "WHILE", "AND", "OR", "NOT", "MOD", "CASE", "RETURN"}
 
 
@@ -3977,6 +3978,124 @@ def remove_user_struct_member(args: argparse.Namespace) -> int:
     return finish_write(args, text, message)
 
 
+def pou_var_references(
+    text: str, root: ET.Element, pou_type: str, pou_name: str, var_name: str
+) -> list[dict[str, object]]:
+    """Every place a POU interface variable is still spelled out.
+
+    Three of them, and none of the three notices the declaration going away on
+    its own: the POU's own ST body, a named argument at a function block call
+    site, and a pin of a graphical block of that type.  A call site that has
+    lost one pin does fail to compile, but with an FBDError id=769 that carries
+    no line number and does not name the pin -- which is exactly why the gate
+    is here rather than left to the compiler.  ST comments are blanked first:
+    a pin named in prose is not a dependency.
+    """
+    rows: list[dict[str, object]] = []
+    ident = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(var_name) + r"(?![A-Za-z0-9_])")
+    own_tag = pou_tag(pou_type)
+
+    raw_own = raw_st_content_by_name(text, own_tag).get(pou_name)
+    if raw_own:
+        masked = blank_st_comments(raw_own)
+        for hit in ident.finditer(masked):
+            rows.append({
+                "where": f"st:{pou_type}:{pou_name}",
+                "line": st_raw_line_number(raw_own, hit.start()),
+                "detail": var_name,
+            })
+
+    # A program is never called by name -- a task owns its programs by
+    # containment -- so it has no call sites to chase.  A FUNCTION does, the
+    # same way a FUNCTION_BLOCK does.
+    if pou_type == "program":
+        return rows
+
+    for caller_type, caller_tag in POU_TAGS.items():
+        for caller_name, raw in raw_st_content_by_name(text, caller_tag).items():
+            if caller_tag == own_tag and caller_name == pou_name:
+                continue
+            # ST_CALL_RE stops the argument list at the first ";", and a raw
+            # CONTENT spells "=>" as "=&gt;" -- those entity semicolons would
+            # cut every multi-line call short.  Mask entities to same-length
+            # filler so offsets, and therefore line numbers, stay exact.
+            masked = XML_ENTITY_RE.sub(
+                lambda hit: "_" * len(hit.group(0)), blank_st_comments(raw)
+            )
+            for call in ST_CALL_RE.finditer(masked):
+                if call.group(1) != pou_name or not ident.search(call.group(2)):
+                    continue
+                rows.append({
+                    "where": f"call:{caller_type}:{caller_name}",
+                    "line": st_raw_line_number(raw, call.start()),
+                    "detail": f"{pou_name}(... {var_name} ...)",
+                })
+
+    for caller_type, caller_tag in POU_TAGS.items():
+        for caller in root.findall(f".//{caller_tag}"):
+            caller_name = attr(caller, "NAME")
+            for block in caller.iter("CONTROL_LOGIC_BLOCK"):
+                if attr(block, "TYPE") != pou_name:
+                    continue
+                for pin_tag in ("BLOCK_PIN_INPUT", "BLOCK_PIN_OUTPUT"):
+                    for pin in block.iter(pin_tag):
+                        if attr(pin, "NAME") == var_name:
+                            rows.append({
+                                "where": f"graphic:{caller_type}:{caller_name}:{attr(block, 'NAME')}",
+                                "line": "",
+                                "detail": f"{pin_tag}:{var_name}",
+                            })
+    return rows
+
+
+def remove_pou_var(args: argparse.Namespace) -> int:
+    """Drop one interface variable of a POU -- for a function block, one pin.
+
+    A pin lives in three places that have to move together: the
+    `SECTION_VAR_*` declaration removed here, the assignments and reads inside
+    the block's own ST, and the named argument at every call site.  This
+    command only removes the declaration; the ST half is an ordinary text edit,
+    so do it through the workspace round trip and expect one pass where the
+    project does not compile (see SKILL.md, "Changing a function block's
+    pins").  The reference list this refuses with is the checklist for that
+    pass.
+    """
+    if not args.pou_type or not args.name:
+        raise ValueError("--pou-type and --name are required for kind=pou-var")
+    if not args.var_section or not args.var:
+        raise ValueError("--var-section and --var are required for kind=pou-var")
+
+    text = read_text(args.project, args.encoding)
+    root = parse_xml(text)
+    tag = pou_tag(args.pou_type)
+    pou = next((elem for elem in root.iter(tag) if attr(elem, "NAME") == args.name), None)
+    if pou is None:
+        raise ValueError(f"{tag} {args.name!r} not found")
+    section_tag = POU_VAR_SECTIONS[args.var_section]
+    if not any(attr(var, "NAME") == args.var for var in pou.findall("./" + section_tag)):
+        raise ValueError(
+            f"{tag} {args.name!r} has no {args.var_section} variable {args.var!r}"
+        )
+
+    refs = pou_var_references(text, root, args.pou_type, args.name, args.var)
+    if refs and not args.force:
+        raise ValueError(
+            f"{args.name}.{args.var} is still referenced in {len(refs)} place(s):\n"
+            + format_references(refs)
+            + "\npass --force to remove it anyway"
+        )
+
+    span = find_named_span(text, tag, args.name)
+    trimmed = remove_element(
+        span.raw, section_tag, lambda attrs_map: attrs_map.get("NAME") == args.var
+    )
+    new_text = text[:span.start] + trimmed + text[span.end:]
+    message = f"RemovedPouVar={args.pou_type}:{args.name}:{args.var_section}:{args.var}"
+    if refs:
+        message += f" forcedOverReferences={len(refs)}"
+    return finish_write(args, new_text, message)
+
+
 def remove_pou(args: argparse.Namespace) -> int:
     """Delete a whole PROGRAM or FUNCTION_BLOCK, logic included.
 
@@ -4068,6 +4187,8 @@ def cmd_remove_entity(args: argparse.Namespace) -> int:
         return remove_user_struct_member(args)
     if args.kind == "pou":
         return remove_pou(args)
+    if args.kind == "pou-var":
+        return remove_pou_var(args)
     if args.kind == "slave-object":
         return remove_slave_object(args)
 
@@ -5950,14 +6071,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="do not carry existing per-element DESC across the rebuild")
     p.set_defaults(func=cmd_rebuild_variable_members)
 
-    p = sub.add_parser("remove", help="delete a variable, user data type, struct member, POU or CANopen slave object")
+    p = sub.add_parser("remove", help="delete a variable, user data type, struct member, POU, POU interface variable or CANopen slave object")
     add_common_project_arg(p)
     p.add_argument("--kind", required=True,
-                   choices=["variable", "user-struct", "user-struct-member", "pou", "slave-object"])
+                   choices=["variable", "user-struct", "user-struct-member", "pou", "pou-var", "slave-object"])
     p.add_argument("--name", help="VARIABLE / USER_STRUCT / POU name")
     p.add_argument("--struct", help="user data type owning the member, for kind=user-struct-member")
     p.add_argument("--member", help="member to delete, for kind=user-struct-member")
-    p.add_argument("--pou-type", choices=sorted(POU_TAGS), help="for kind=pou; default program")
+    p.add_argument("--pou-type", choices=sorted(POU_TAGS), help="for kind=pou; default program. Required for kind=pou-var")
+    p.add_argument("--var-section", choices=sorted(POU_VAR_SECTIONS),
+                   help="which interface section holds the variable, for kind=pou-var")
+    p.add_argument("--var", help="POU interface variable to delete, for kind=pou-var. On a function block this is one pin")
     p.add_argument("--port-id", help="downlink port ID, for kind=slave-object")
     p.add_argument("--index", help="object index, decimal or 0x-prefixed, for kind=slave-object")
     p.add_argument("--force", action="store_true",

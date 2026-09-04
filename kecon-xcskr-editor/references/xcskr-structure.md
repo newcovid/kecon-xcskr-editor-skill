@@ -163,8 +163,18 @@ integer types, `0.000` for `REAL`.
   agrees with the logic section element actually present). Trust the section tag.
 - ST is stored in `SECTION_LOGIC_ST` as the `CONTENT` attribute.
 - Function block pins are stored as `SECTION_VAR_INPUT`, `SECTION_VAR_OUTPUT`, and `SECTION_VAR_INTERNAL`.
+  Document order inside each section **is** the pin order a call site must use, so adding or
+  removing one changes every call site (see SKILL.md, "Changing a function block's pins").
+  The declaration is the only copy of the pin list in the file; a call site names its pins but
+  never declares them, and a graphical block of that type carries `BLOCK_PIN_INPUT` /
+  `BLOCK_PIN_OUTPUT` children whose `NAME` repeats the pin and does not move with it.
 - A function block can have valid pins while its ST content is empty; inspect both interface and ST.
 - Raw ST line breaks can be literal LF, `&#10;`, or `&#x0D;&#x0A;`; all three are valid and the writer keeps whichever is already there.
+- A raw `CONTENT` value is XML-escaped, so ST that reads `Out=>X` is stored as `Out=&gt;X`.
+  Any pattern run against raw ST has to allow for that, and the trap is the entity's own
+  trailing `;`: a regex that ends an argument list at the first `;` cuts every call with an
+  output pin short. Either read the decoded `CONTENT` through the parser, or mask entities to
+  same-length filler first so offsets, and therefore reported line numbers, stay exact.
 - **A POU is self-contained.** Its logic and its interface are children of its
   own element, and no element outside it repeats its name: a task owns its
   programs by containment and document order, not by name. So deleting the

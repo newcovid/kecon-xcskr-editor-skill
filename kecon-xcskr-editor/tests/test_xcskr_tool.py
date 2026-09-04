@@ -1889,6 +1889,107 @@ class XcskrToolTests(unittest.TestCase):
             self.assertIn("DRY_RUN=OK", result.stdout)
             self.assertEqual(project.read_bytes(), before)
 
+    def test_remove_pou_var_drops_an_unreferenced_internal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            done = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                            "--pou-type", "function-block", "--name", "FB_SCALE",
+                            "--var-section", "internal", "--var", "Offset", "--no-backup")
+
+            self.assertIn("RemovedPouVar=function-block:FB_SCALE:internal:Offset", done.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn('<SECTION_VAR_INTERNAL NAME="Offset"', after)
+            self.assertIn('<SECTION_VAR_INPUT NAME="InValue"', after)
+            self.assertIn('<SECTION_VAR_OUTPUT NAME="Scale"', after)
+
+    def test_remove_pou_var_refuses_while_the_body_and_a_call_site_use_it(self) -> None:
+        # A pin lives in three places at once.  Deleting only the declaration
+        # leaves one FBDError id=769 per call site, with no line number and no
+        # pin named, so the refusal doubles as the checklist for the ST pass.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            before = project.read_text(encoding="gbk", newline="")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                               "--pou-type", "function-block", "--name", "FB_SCALE",
+                               "--var-section", "output", "--var", "Scale",
+                               "--no-backup", check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("st:function-block:FB_SCALE", refused.stderr)
+            self.assertIn("call:program:MainProgram", refused.stderr)
+            self.assertEqual(project.read_text(encoding="gbk", newline=""), before)
+
+            forced = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                              "--pou-type", "function-block", "--name", "FB_SCALE",
+                              "--var-section", "output", "--var", "Scale",
+                              "--force", "--no-backup")
+
+            self.assertIn("forcedOverReferences=", forced.stdout)
+            after = project.read_text(encoding="gbk", newline="")
+            self.assertNotIn('<SECTION_VAR_OUTPUT NAME="Scale"', after)
+            # Only the declaration went; the ST half is the caller's own edit.
+            self.assertIn("Scale=>StatusWords[0]", after)
+
+    def test_remove_pou_var_sees_a_call_split_over_lines(self) -> None:
+        # replace-st stores "=>" as "=&gt;", and the entity's semicolon used to
+        # cut the argument list short: every multi-line call read as unrelated
+        # and the removal went through silently.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            self.put_st(
+                project,
+                "CycleProgram",
+                "FB_SCALE(InValue:=1,\r\n         Scale=>StatusWords[0]);\r\n",
+            )
+            self.assertIn("=&gt;", project.read_text(encoding="gbk", newline=""))
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                               "--pou-type", "function-block", "--name", "FB_SCALE",
+                               "--var-section", "input", "--var", "InValue",
+                               "--no-backup", check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("call:program:CycleProgram:1", refused.stderr)
+
+    def test_remove_pou_var_sees_a_graphical_pin(self) -> None:
+        # A graphical block draws its pins by name, and the drawing survives
+        # the declaration without a word from the compiler.
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+            run_tool("add-function-block", "--project", str(project), "--name", "MOV",
+                     "--desc", "generic move", "--no-backup")
+            run_tool("add-pou-var", "--project", str(project), "--name", "MOV",
+                     "--var-section", "output", "--var", "OUT:BYTE:moved value",
+                     "--no-backup")
+
+            refused = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                               "--pou-type", "function-block", "--name", "MOV",
+                               "--var-section", "output", "--var", "OUT",
+                               "--no-backup", check=False)
+
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("graphic:program:LadderProgram:_MODULE1", refused.stderr)
+            self.assertIn("BLOCK_PIN_OUTPUT:OUT", refused.stderr)
+
+    def test_remove_pou_var_needs_the_section_and_the_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = self.make_project(Path(temp))
+
+            missing = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                               "--pou-type", "function-block", "--name", "FB_SCALE",
+                               "--no-backup", check=False)
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("--var-section and --var are required", missing.stderr)
+
+            wrong = run_tool("remove", "--project", str(project), "--kind", "pou-var",
+                             "--pou-type", "function-block", "--name", "FB_SCALE",
+                             "--var-section", "input", "--var", "Scale",
+                             "--no-backup", check=False)
+            self.assertEqual(wrong.returncode, 2)
+            self.assertIn("has no input variable", wrong.stderr)
+
     def test_remove_function_block_refuses_while_it_is_called(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             project = self.make_project(Path(temp))
