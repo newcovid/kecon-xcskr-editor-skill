@@ -164,8 +164,8 @@ Inside that window `check-workspace` reports one `pin not declared: <pin>` per
 call site, from `validate-fb-calls`. That is the expected state, and it falling
 silent is how you know step 3 is complete (*verified*: removing an output pin
 from a project function block with three ST call sites -- the checker named all
-three and went quiet once the calls were edited). Whether the GUI accepts a pin
-list edited this way is **not verified**; compile once in xRobotDesigner before
+three and went quiet once the calls were edited, and xRobotDesigner then compiled
+the project without touching the block in the GUI). Still compile once before
 downloading. Do not open the GUI before step 4 -- it would save the half-edited
 project back over the file.
 
