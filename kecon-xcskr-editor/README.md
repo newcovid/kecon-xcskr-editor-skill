@@ -8,6 +8,16 @@ edits it by patching raw XML spans, because re-serializing the whole document
 through an XML library flattens the ST source stored inside an attribute and the
 IDE then shows an empty program.
 
+## POU variable scope
+
+PROGRAM state must use the registered global variable/structure tree, with
+expanded members rebuilt after a type change. The editor refuses PROGRAM
+`SECTION_VAR_*` additions. Custom ST function blocks use their declared pins
+and locals; pass project-global data through pins. `validate-pou-scope` is
+included in `check-workspace`. See [the compiler evidence and migration
+rules](references/pou-scope.md). Numeric execution does not replace checking
+declarations or recompiling the changed project in xRobotDesigner.
+
 ## Install
 
 Copy the folder somewhere and call the script directly:

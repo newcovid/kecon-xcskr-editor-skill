@@ -1063,6 +1063,7 @@ PROJECT_VALIDATORS = [
     ("validate-desc-length", ["--strict"]),
     ("validate-desc-drift", ["--strict"]),
     ("validate-array-index", []),
+    ("validate-pou-scope", []),
     ("validate-modbus-mapping", []),
     ("validate-comment-balance", []),
 ]

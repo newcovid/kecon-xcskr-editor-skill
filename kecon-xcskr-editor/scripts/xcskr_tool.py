@@ -5758,7 +5758,85 @@ def cmd_add_function_block(args: argparse.Namespace) -> int:
     return finish_write(args, new_text, f"AddedFunctionBlock={args.name} lang={args.lang} vars={total}")
 
 
+def collect_pou_scope_problems(text: str) -> list[dict[str, object]]:
+    """Check observed compiler scope boundaries, not general ST name resolution."""
+    root = parse_xml(text)
+    globals_ = {
+        attr(var, "NAME").casefold(): attr(var, "NAME")
+        for tag in ("VARIABLE", "HARDWARE_CHANNEL_TAG", "HARDWARE_FLAG_TAG")
+        for var in root.iter(tag)
+        if attr(var, "NAME").isidentifier()
+    }
+    rows: list[dict[str, object]] = []
+    for pou in root.iter("PROGRAM"):
+        for section in POU_VAR_SECTIONS.values():
+            for var in pou.findall("./" + section):
+                rows.append({
+                    "pou_type": "program", "pou": attr(pou, "NAME"), "line": 1,
+                    "variable": attr(var, "NAME"), "status": "PROGRAM_LOCAL_NOT_SUPPORTED",
+                    "problem": "PROGRAM SECTION_VAR_* is not a supported compiler-visible scope; register program state in the global variable table",
+                })
+
+    # Match strings and comments together: comment markers inside strings are
+    # data. Keep newlines so the decoded CONTENT still gives real ST lines.
+    ignored = re.compile(r"\(\*[\s\S]*?\*\)|//[^\n]*|'(?:\$[\s\S]|''|[^'])*'|\"(?:\$[\s\S]|\"\"|[^\"])*\"")
+    identifier = re.compile(r"[^\W\d]\w*", re.UNICODE)
+    not_calls = {"IF", "ELSEIF", "WHILE", "UNTIL", "CASE", "FOR", "NOT", "AND", "OR", "XOR", "MOD", "RETURN"}
+    for span in iter_named_spans(text, "FUNCTION_BLOCK"):
+        pou = parse_xml(span.raw)
+        local_names = {
+            attr(var, "NAME").casefold()
+            for section in POU_VAR_SECTIONS.values()
+            for var in pou.findall("./" + section)
+        }
+        try:
+            _, _, raw = find_section_logic_raw(span.raw)
+        except ValueError:
+            continue  # This check does not interpret graphical logic.
+        content = normalize_newlines(decode_xml_attr_fragment(raw))
+        code = ignored.sub(lambda m: "".join("\n" if ch == "\n" else " " for ch in m[0]), content)
+        tokens = list(re.finditer(r"[^\W\d]\w*|:=|=>|\S", code, re.UNICODE))
+        calls: list[bool] = []
+        reported: set[str] = set()
+        for index, token in enumerate(tokens):
+            value = token[0]
+            previous = tokens[index - 1][0] if index else ""
+            following = tokens[index + 1][0] if index + 1 < len(tokens) else ""
+            if value == "(":
+                calls.append(bool(identifier.fullmatch(previous)) and previous.upper() not in not_calls)
+            elif value == ")":
+                if calls:
+                    calls.pop()
+            key = value.casefold()
+            named_pin = bool(calls and calls[-1] and previous in ("(", ",") and following in ("=", ":=", "=>"))
+            if key not in globals_ or key in local_names or key in reported or previous == "." or named_pin:
+                continue
+            reported.add(key)
+            rows.append({
+                "pou_type": "function-block", "pou": span.name,
+                "line": code.count("\n", 0, token.start()) + 1,
+                "variable": globals_[key], "status": "GLOBAL_OUTSIDE_FB_SCOPE",
+                "problem": "project globals are outside the observed custom FUNCTION_BLOCK ST scope; pass values through declared pins",
+            })
+    return rows
+
+
+def cmd_validate_pou_scope(args: argparse.Namespace) -> int:
+    rows = collect_pou_scope_problems(read_text(args.project, args.encoding))
+    output_rows(rows, ["pou_type", "pou", "line", "variable", "status", "problem"],
+                args.format, args.output, args.output_encoding)
+    print(f"POU_SCOPE=FAIL Problems={len(rows)}" if rows else "POU_SCOPE=OK")
+    return 1 if rows else 0
+
+
 def cmd_add_pou_var(args: argparse.Namespace) -> int:
+    if args.pou_type == "program":
+        raise ValueError(
+            "PROGRAM-local variables are not supported by this editor: "
+            "V5.1.1.9998-C did not resolve SECTION_VAR_* names. "
+            "Use add-variable or add-user-struct-member plus rebuild-variable-members, "
+            "then reference the registered global variable in program ST."
+        )
     text = read_text(args.project, args.encoding)
     root = parse_xml(text)
     tag = pou_tag(args.pou_type)
@@ -6205,7 +6283,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-backup", action="store_true")
     p.set_defaults(func=cmd_add_function_block)
 
-    p = sub.add_parser("add-pou-var", help="append interface variables to an existing POU")
+    p = sub.add_parser("validate-pou-scope", help="check PROGRAM declarations and custom FUNCTION_BLOCK global access")
+    add_common_project_arg(p)
+    add_output_args(p)
+    p.set_defaults(func=cmd_validate_pou_scope)
+
+    p = sub.add_parser("add-pou-var", help="append function/function-block variables; PROGRAM locals are refused")
     add_common_project_arg(p)
     p.add_argument("--pou-type", choices=sorted(POU_TAGS), default="function-block")
     p.add_argument("--name", required=True)

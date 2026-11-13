@@ -16,7 +16,7 @@ xRobotDesigner `.xcskr` PLC 工程。
 ### 写入
 
 - 新建 PROGRAM、调整任务内程序执行顺序（程序按文档顺序执行，顺序即语义）。
-- 新建 FUNCTION_BLOCK 及其接口变量，追加 POU 接口变量。
+- 新建 FUNCTION_BLOCK 及其接口变量，追加函数/功能块变量；PROGRAM状态须登记到工程全局变量表。
 - 新建用户数据类型和自定义变量，自动生成 VARIABLE_MEMBER 成员树；结构体改动后可用
   `rebuild-variable-members` 重建，`validate-datatypes` 递归查成员树漂移。
 - 图形逻辑：引脚绑定变量、两引脚连线、拆线、从参考工程复制功能块。
@@ -50,12 +50,15 @@ xRobotDesigner `.xcskr` PLC 工程。
 | `validate-slave-objects` | 从站对象名、数据类型、绑定预算三项 GUI 才校验的限制 |
 | `validate-command-directions` | 读从站数据的命令组被留成了输出命令 -- 导入 EDS 会静默改回去 |
 | `validate-fb-calls` | 功能块调用的实参顺序与声明顺序不一致 |
+| `validate-pou-scope` | PROGRAM局部声明未进入编译作用域，或自定义ST块直接访问工程全局变量 |
 | `validate-desc-length` | 超长 DESC。XML 收，GUI 下次打开那个字段就再也保存不了 |
 | `validate-array-index` | 位串当数组下标 |
 | `validate-comment-balance` | 没闭合的 `(*` 把后面整段代码吃掉，编译不报错 |
 | `validate-modbus-mapping` | 映射窗口里标签宽度与地址空间对不上，编译只报窗口名不报标签 |
 | `validate-desc-drift` | 改了结构体成员的 DESC 却没重建变量成员树，监控里还显示旧文本 |
 | `validate-controller-support` | 用了本型号控制器不支持的功能 |
+
+PROGRAM与自定义ST功能块的作用域不同，变量登记和验证边界见[POU作用域约束](kecon-xcskr-editor/references/pou-scope.md)。
 
 ### 写入保真
 

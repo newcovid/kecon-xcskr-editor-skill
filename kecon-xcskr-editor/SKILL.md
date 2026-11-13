@@ -279,6 +279,7 @@ python ... validate-slave-objects --project P          # name, DATATYPE and per-
 python ... validate-hardware-bindings --project P
 python ... validate-command-directions --project P
 python ... validate-fb-calls --project P
+python ... validate-pou-scope --project P
 python ... validate-desc-length --project P --strict   # only a tool can write an over-long DESC
 python ... validate-desc-drift --project P --strict    # member DESC changed, variables not rebuilt
 python ... validate-array-index --project P            # a bit string cannot subscript an array
@@ -417,6 +418,19 @@ Read `references/xcskr-structure.md` before changing hardware, task, variable, P
 - Do not expect a bare `>` inside `SECTION_LOGIC_ST CONTENT`. Counted across two production projects (IVC300 and IVC200 controllers) and the official GUI-authored sample: 845 occurrences of `&gt;` and zero bare `>`. Writing a bare `>` parses, but it is not what the GUI produces.
 
 ### ST and tasks
+
+- **Keep PROGRAM and custom ST FUNCTION_BLOCK scopes separate.** Do not add
+  `SECTION_VAR_*` declarations under a PROGRAM. Register program state and
+  scratch in the existing global variable/structure tree and rebuild its
+  expanded members before exporting and using qualified ST paths. Custom ST
+  blocks use their own declared pins and locals; pass project data through
+  pins. V5.1.1.9998-C GUI compiler logs establish these scope boundaries;
+  other versions need separate evidence. [POU scope constraints](references/pou-scope.md).
+- `add-pou-var --pou-type program` refuses before writing. Run
+  `validate-pou-scope` after variable changes; `check-workspace` includes it.
+  Check actual declarations, expanded variable members and ST references;
+  numeric tests cannot establish compiler visibility, and static checks do
+  not replace recompiling the changed project in the vendor GUI.
 
 - A variable bound into the object dictionary is read asynchronously by the
   master and must be assigned **once per scan**. Building a status word with
